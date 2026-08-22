@@ -833,3 +833,180 @@ Reason: --force triggers an Administrator password reset with no CLI flag to
         skip or supply it; kubectl exec -i plus a piped answer is the only
         non-interactive workaround. Applies to any future --force install-app
         or similar interactive-prompt bench command run via automation.
+
+## 2026-08-23 — Tier B Command Tests (test.local, frappe-v15)
+
+All commands run via `kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd /home/frappe/bench-data/frappe-bench && <command>"` unless noted.
+
+### B1: uninstall-app — ✅ Pass (fails by design)
+```
+$ bench --site test.local uninstall-app frappe --no-backup --yes --force
+You cannot remove or uninstall the app `frappe`
+command terminated with exit code 1
+```
+Expected: `frappe` is the framework itself — the only app on this site — and Frappe explicitly blocks uninstalling it. Marked **Pass** because the command behaved exactly as documented/intended (a guardrail, not a bug).
+
+### B3: add-system-manager — ✅ Pass
+```
+$ bench --site test.local add-system-manager sysmanager@test.com --password ***REDACTED***
+(no output) — EXIT: 0
+```
+Silent on success; verified via `bench --site test.local execute frappe.get_roles --args '["sysmanager@test.com"]'` → role list includes `"System Manager"`.
+
+### B4/B5/B6: scheduler pause/resume/enable — ✅ Pass
+```
+$ bench --site test.local scheduler pause
+Scheduler is paused for site test.local
+$ bench --site test.local scheduler resume
+Scheduler is resumed for site test.local
+$ bench --site test.local scheduler enable
+Scheduler is enabled for site test.local
+```
+All three exit 0 with clear confirmation messages.
+
+### B7: set-admin-password — ✅ Pass
+```
+$ bench --site test.local set-admin-password ***REDACTED***
+(no output) — EXIT: 0
+```
+
+### B9: execute (get installed apps) — ✅ Pass
+```
+$ bench --site test.local execute frappe.get_installed_apps
+["frappe"]
+```
+
+### B11: build-search-index — ⚡ Pass with caveat
+```
+$ bench --site test.local build-search-index
+Building search index for test.local
+Retrieving Routes                   : [=                                       ] 3%
+EXIT: 0
+```
+No search-index files found under `sites/test.local/` afterward. `bench doctor` (B19, run later) revealed why: this command **enqueues** a background RQ job (`build_index_for_all_routes`, queue `long`) rather than running synchronously — and confirmed via `bench doctor`: `Workers online: 0`, with that exact job sitting in the backlog. **Modification/caveat: this command only queues work; it needs a running `bench worker` process (not present in this bare test pod) to actually execute.** Not a bug in the command — expected behavior for a pod that only runs `sleep infinity` with no worker processes.
+
+### B14: build (all assets) — ✅ Pass
+```
+$ bench build
+... esbuild bundle output ...
+ DONE  Total Build Time: 15.316s
+Compiling translations for frappe
+... (34 locale .mo files, all up to date) ...
+```
+Exit 0.
+
+### B15: build --app frappe — ✅ Pass
+Same as B14, scoped to the frappe app only. Exit 0, translations compiled.
+
+### B16: setup requirements — ✅ Pass
+```
+$ bench setup requirements
+$ uv pip install --quiet --upgrade pip ...
+Installing 1 applications...
+Installing frappe
+$ uv pip install --quiet -e .../apps/frappe ...
+$ yarn install --check-files
+success Already up-to-date.
+```
+
+### B17: setup requirements --python — ✅ Pass
+```
+$ bench setup requirements --python
+Installing python dependencies for frappe
+$ uv pip install --quiet --upgrade-package frappe -e ./apps/frappe ...
+```
+
+### B18: setup requirements --node — ✅ Pass
+```
+$ bench setup requirements --node
+Installing node dependencies for frappe
+$ yarn install --check-files
+success Already up-to-date.
+```
+
+### B19: doctor — ✅ Pass (diagnostic; surfaced real findings)
+```
+$ bench doctor
+-----Checking scheduler status-----
+Workers online: 0
+-----None Jobs-----
+Queue: default
+Number of Jobs:  4
+Methods:
+frappe.core.doctype.user.user.create_contact : 4
+------------
+Queue: long
+Number of Jobs:  1
+Methods:
+<function build_index_for_all_routes at 0x...> : 1
+------------
+```
+Ran successfully and correctly reported the actual state of this pod: no background workers running (expected — the pod only runs `sleep infinity`), 4 queued `create_contact` jobs (side effects of `add-user`/`add-system-manager`), and the 1 queued search-index job from B11. Confirms this is a bench-CLI-only test pod, not a full runtime — background/queued work needs a separate worker deployment to actually process.
+
+### B2: reinstall site — ⚡ Pass with modification
+```
+$ bench --site test.local reinstall --yes --mariadb-root-username root --mariadb-root-password ***REDACTED***
+Warning: MariaDB version ['10.11', '18'] is more than 10.8 which is not yet tested with Frappe Framework.
+Installing frappe...
+Updating DocTypes for frappe        : [========================================] 100%Warning: Password input may be echoed.
+Set Administrator password:
+Aborted!
+command terminated with exit code 1
+```
+**Failure cause:** `--yes` only skips the initial "are you sure" confirmation — it does **not** cover the Administrator password prompt when `--admin-password` isn't supplied. No stdin available, so it hit EOF and aborted (same class of issue as A2, but here `bench reinstall --help` confirms an official `--admin-password` flag exists).
+
+**Modification:** added `--admin-password admin123` directly to the command (cleaner than piping stdin, since the flag exists):
+```
+$ bench --site test.local reinstall --yes --mariadb-root-username root --mariadb-root-password ***REDACTED*** --admin-password ***REDACTED***
+...
+Updating DocTypes for frappe        : [========================================] 100%
+Updating Dashboard for frappe
+App frappe already installed
+*** Scheduler is disabled ***
+```
+Exit 0. Verified the site was genuinely wiped and recreated: `testuser@test.com` (added in Tier A) no longer exists post-reinstall.
+
+### Tier B Summary
+
+| ID | Command | Result | Notes |
+|---|---|---|---|
+| B1 | uninstall-app frappe | ✅ Pass | Fails by design — frappe is the only/core app |
+| B3 | add-system-manager | ✅ Pass | Silent success; verified via `get_roles` |
+| B4 | scheduler pause | ✅ Pass | — |
+| B5 | scheduler resume | ✅ Pass | — |
+| B6 | scheduler enable | ✅ Pass | — |
+| B7 | set-admin-password | ✅ Pass | Silent success |
+| B9 | execute get_installed_apps | ✅ Pass | — |
+| B11 | build-search-index | ⚡ Pass with caveat | Only enqueues a background job; needs a worker process to actually run (none in this pod) |
+| B14 | build (all assets) | ✅ Pass | — |
+| B15 | build --app frappe | ✅ Pass | — |
+| B16 | setup requirements | ✅ Pass | — |
+| B17 | setup requirements --python | ✅ Pass | — |
+| B18 | setup requirements --node | ✅ Pass | — |
+| B19 | doctor | ✅ Pass | Confirmed no workers online + the B11 queue backlog |
+| B2 | reinstall site | ⚡ Pass with modification | `--yes` doesn't cover the admin-password prompt; added `--admin-password` flag |
+
+**13/15 passed cleanly, 2/15 passed with a modification/caveat (B2, B11).**
+
+## Decision Log (additions)
+
+### D8: bench reinstall admin password
+Question: How to run bench reinstall non-interactively when no admin password is given?
+Options considered:
+  - --yes only → FAILED (still prompts for Administrator password, no stdin, aborts)
+  - --admin-password flag → ✅ CHOSEN
+Reason: --yes only skips the destructive-action confirmation, not the password
+        setup step. --admin-password is a documented flag on `bench reinstall`
+        (unlike install-app --force, which has no equivalent) — cleaner than
+        piping stdin. Applies to any future automated `bench reinstall` call.
+
+### D9: build-search-index is asynchronous
+Question: Does build-search-index index synchronously or in the background?
+Finding: It enqueues a job (build_index_for_all_routes) on the "long" RQ queue
+         rather than running inline — confirmed via `bench doctor` showing
+         0 workers online and that exact job sitting unprocessed.
+Implication: In a bare bench-CLI pod (no worker processes), this command will
+             always appear to finish instantly without actually indexing
+             anything. A real deployment needs a running worker (e.g. a
+             `bench worker` Deployment) for this — and other queued jobs like
+             contact creation — to actually execute.
