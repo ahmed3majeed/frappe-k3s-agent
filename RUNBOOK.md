@@ -532,3 +532,71 @@ command terminated with exit code 1
 `frappe/bench:latest` is a bare toolchain image — it ships the `bench` CLI, Python, Node, and their dependency stacks, but **no initialized bench project**. Confirmed via `find`/`ls`: `/home/frappe` contains only `.bench` (the CLI's own package metadata), no `frappe-bench`/`sites` directory. `bench set-*-host` writes into `./sites/common_site_config.json`, which only exists after `bench init` has created a bench directory. Steps 5–7 as specified assume that directory already exists and skip `bench init` entirely.
 
 **Stopping here per instructions** — need a decision on the `bench init` invocation (bench directory name, Frappe branch/version to fetch — namespace is `frappe-v15` suggesting `version-15`, and whether to init in the pod's home dir or a mounted volume so it survives pod restarts) before continuing to a corrected Step 5.
+
+## 2026-08-22 — Bench Pod Fix: PVC + bench init
+
+Per user direction: use Frappe branch `version-15` (matches the `frappe-v15` namespace), and back the bench pod with a PVC so work survives pod restarts (this test pod would otherwise lose all bench state on any restart).
+
+### Recreated pod with persistent storage
+```
+kubectl delete pod bench-v15 -n frappe-v15
+```
+New manifests written to `/home/frappe/manifests/frappe-v15/`:
+- `bench-pvc.yaml` — `bench-v15-data`, 10Gi, `local-path` storage class.
+- `bench-pod.yaml` — same pod as before, plus the PVC mounted at `/home/frappe/bench-data` (not directly at `frappe-bench` — see below), `workingDir` set there.
+
+```
+$ kubectl apply -f bench-pvc.yaml
+persistentvolumeclaim/bench-v15-data created
+$ kubectl apply -f bench-pod.yaml
+pod/bench-v15 created
+$ kubectl wait --for=condition=Ready pod/bench-v15 -n frappe-v15 --timeout=120s
+pod/bench-v15 condition met
+```
+
+### bench init — attempt 1: FAILED (mount path)
+```
+$ kubectl exec ... -- bash -c "cd /home/frappe && bench init frappe-bench --frappe-branch version-15"
+ERROR: Bench instance already exists at frappe-bench
+```
+Cause: the PVC was originally mounted directly at `/home/frappe/frappe-bench`, so the target directory already existed (empty, but present) when `bench init` ran — `bench init` requires the target path to not exist yet, since it creates it itself. **Fix:** mount the PVC one level up, at `/home/frappe/bench-data`, and run `bench init frappe-bench` from inside that directory so the `frappe-bench` subdirectory doesn't pre-exist.
+
+### bench init — attempt 2: FAILED (redis-server missing)
+```
+$ kubectl exec ... -- bash -c "cd /home/frappe/bench-data && bench init frappe-bench --frappe-branch version-15"
+/bin/sh: 1: redis-server: not found
+subprocess.CalledProcessError: Command 'redis-server --version' returned non-zero exit status 127.
+ERROR: There was a problem while creating frappe-bench
+Do you want to rollback these changes? [y/N]: Aborted!
+```
+Cause: by default `bench init` tries to generate a local Redis config, which shells out to a local `redis-server` binary to check its version — not present in this image, and irrelevant anyway since we're pointing at the external `frappe-system` Redis instances. Partial `frappe-bench` directory (apps/, config/, env/, logs/, sites/) was left behind since the rollback prompt defaulted to No in non-interactive exec; removed it (`rm -rf`) before retrying.
+
+**Fix:** added `--skip-redis-config-generation` (implied by the overall design — bench is meant to use the external Redis services, not a local one).
+
+### bench init — attempt 3: SUCCESS
+```
+$ kubectl exec ... -- bash -c "cd /home/frappe/bench-data && bench init frappe-bench --frappe-branch version-15 --skip-redis-config-generation"
+...
+SUCCESS: Bench frappe-bench initialized
+```
+(Frappe framework cloned from `version-15`, Python venv created via `uv`, JS assets built. Some benign `WARN Cannot connect to redis_cache to update assets_json` lines during the asset build — expected, since Redis config wasn't generated in this bench and the asset step doesn't need it to succeed.)
+
+### Step 5: Configure bench hosts — SUCCESS
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+cd /home/frappe/bench-data/frappe-bench
+bench set-mariadb-host mariadb.frappe-system.svc.cluster.local
+bench set-redis-cache-host redis-cache-master.frappe-system.svc.cluster.local:6379
+bench set-redis-queue-host redis-queue-master.frappe-system.svc.cluster.local:6380
+bench set-redis-socketio-host redis-socketio-master.frappe-system.svc.cluster.local:6381
+cat sites/common_site_config.json
+"
+{
+ "db_host": "mariadb.frappe-system.svc.cluster.local",
+ "redis_cache": "redis-cache-master.frappe-system.svc.cluster.local:6379",
+ "redis_queue": "redis-queue-master.frappe-system.svc.cluster.local:6380",
+ "redis_socketio": "redis-socketio-master.frappe-system.svc.cluster.local:6381",
+ ...
+}
+```
+All four infrastructure hosts confirmed correctly written to `common_site_config.json`.
