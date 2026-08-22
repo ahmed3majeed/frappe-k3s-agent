@@ -481,3 +481,54 @@ All three Redis instances respond correctly on their designated ports.
 1. **MariaDB Helm version** `20.x.x` → resolved to chart `12.2.9` (MariaDB 10.11.4), per explicit confirmation to prioritize the 10.11 requirement.
 2. **MariaDB delivery mechanism** Bitnami chart → dropped entirely in favor of native Kubernetes manifests with the official `mariadb:10.11` image, after two chart-based attempts failed (missing free-tier image tag, then incompatible container conventions when overriding just the image). Per explicit user decision.
 3. **Credentials** never committed to this public repo in plaintext — real values live only in `/home/frappe/mariadb-values.yaml` (chmod 600, unused after the pivot) and `/home/frappe/manifests/mariadb/secret.yaml` (chmod 600) on the server, and in the in-cluster `mariadb-secret` Kubernetes Secret.
+
+## 2026-08-22 — First Frappe Bench Pod (frappe-v15)
+
+### Step 1: Namespace
+```
+$ kubectl create namespace frappe-v15
+namespace/frappe-v15 created
+```
+
+### Step 2: Create bench pod
+```
+$ kubectl run bench-v15 \
+  --image=frappe/bench:latest \
+  --namespace=frappe-v15 \
+  --restart=Never \
+  --env="MARIADB_HOST=mariadb.frappe-system.svc.cluster.local" \
+  -- sleep infinity
+pod/bench-v15 created
+```
+
+### Step 3: Wait for Ready
+```
+$ kubectl wait --for=condition=Ready pod/bench-v15 -n frappe-v15 --timeout=120s
+pod/bench-v15 condition met
+```
+`kubectl get pod bench-v15` → `1/1 Running`.
+
+### Step 4: Verify bench available
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bench --version
+5.31.0
+```
+
+### Step 5: Configure bench hosts — FAILED
+
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  bench set-mariadb-host mariadb.frappe-system.svc.cluster.local
+  ...
+"
+WARN: Command not being executed in bench directory
+ERROR: [Errno 2] No such file or directory: './sites/common_site_config.json'
+FileNotFoundError: [Errno 2] No such file or directory: './sites/common_site_config.json'
+command terminated with exit code 1
+```
+(same error repeated for all four `bench set-*-host` calls)
+
+### Root cause
+`frappe/bench:latest` is a bare toolchain image — it ships the `bench` CLI, Python, Node, and their dependency stacks, but **no initialized bench project**. Confirmed via `find`/`ls`: `/home/frappe` contains only `.bench` (the CLI's own package metadata), no `frappe-bench`/`sites` directory. `bench set-*-host` writes into `./sites/common_site_config.json`, which only exists after `bench init` has created a bench directory. Steps 5–7 as specified assume that directory already exists and skip `bench init` entirely.
+
+**Stopping here per instructions** — need a decision on the `bench init` invocation (bench directory name, Frappe branch/version to fetch — namespace is `frappe-v15` suggesting `version-15`, and whether to init in the pod's home dir or a mounted volume so it survives pod restarts) before continuing to a corrected Step 5.
