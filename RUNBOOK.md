@@ -600,3 +600,47 @@ cat sites/common_site_config.json
 }
 ```
 All four infrastructure hosts confirmed correctly written to `common_site_config.json`.
+
+## 2026-08-22 — Step 6 (retry) & Step 7: new-site + verification — SUCCESS
+
+### Redis URL scheme fix
+```
+$ kubectl exec ... -- bash -c "cd .../frappe-bench && bench new-site test.local --no-mariadb-socket --db-host ... --mariadb-root-username root --mariadb-root-password *** --admin-password ***"
+...
+ValueError: Redis URL must specify one of the following schemes (redis://, rediss://, unix://)
+```
+Cause: `bench set-redis-*-host` (Step 5, as literally specified) writes a bare `host:port` value, but this Frappe version's Redis client requires a full URL with scheme. **Fix:** re-ran `bench set-redis-cache-host` / `-queue-host` / `-socketio-host` with `redis://` prefixed onto each host:port value. Re-verified `common_site_config.json` — all three now read `redis://<host>.frappe-system.svc.cluster.local:<port>`.
+
+### Step 6: bench new-site test.local — SUCCESS
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+cd /home/frappe/bench-data/frappe-bench
+bench new-site test.local \
+  --no-mariadb-socket \
+  --db-host mariadb.frappe-system.svc.cluster.local \
+  --mariadb-root-username root \
+  --mariadb-root-password *** \
+  --admin-password ***
+"
+--no-mariadb-socket is DEPRECATED; use --mariadb-user-host-login-scope='%' (wildcard) or --mariadb-user-host-login-scope=<myhostscope>, instead.
+Warning: MariaDB version ['10.11', '18'] is more than 10.8 which is not yet tested with Frappe Framework.
+
+Installing frappe...
+Updating DocTypes for frappe        : [========================================] 100%
+Updating Dashboard for frappe
+*** Scheduler is disabled ***
+```
+Two informational warnings, not errors: `--no-mariadb-socket` is deprecated in favor of `--mariadb-user-host-login-scope` (still functioned correctly here); and Frappe hasn't been tested against MariaDB >10.8 yet (informational compatibility notice — worked fine in practice for a base site install).
+
+### Step 7: verify site — SUCCESS
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local list-apps"
+frappe 15.118.0 version-15
+```
+
+**`test.local` created successfully on frappe-v15, backed by the shared `frappe-system` MariaDB + Redis infrastructure.** Bench data (frappe-bench directory, site files, DB config) persists on the `bench-v15-data` PVC across pod restarts.
+
+### Summary of deviations from the original spec (this task)
+1. **Pod → Pod + PVC:** added a PersistentVolumeClaim (`bench-v15-data`, 10Gi) so bench state survives restarts; per user decision.
+2. **`bench init` added:** the original steps assumed an already-initialized bench directory; `frappe/bench:latest` only ships the CLI. Added `bench init frappe-bench --frappe-branch version-15 --skip-redis-config-generation` before Step 5, with the PVC mounted one directory above `frappe-bench` (init requires the target path not to pre-exist).
+3. **Redis host format:** `bench set-redis-*-host` values needed a `redis://` scheme prefix; bare `host:port` (as literally specified) caused `bench new-site` to fail on Redis connection setup.
