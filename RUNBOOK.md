@@ -644,3 +644,192 @@ frappe 15.118.0 version-15
 1. **Pod → Pod + PVC:** added a PersistentVolumeClaim (`bench-v15-data`, 10Gi) so bench state survives restarts; per user decision.
 2. **`bench init` added:** the original steps assumed an already-initialized bench directory; `frappe/bench:latest` only ships the CLI. Added `bench init frappe-bench --frappe-branch version-15 --skip-redis-config-generation` before Step 5, with the PVC mounted one directory above `frappe-bench` (init requires the target path not to pre-exist).
 3. **Redis host format:** `bench set-redis-*-host` values needed a `redis://` scheme prefix; bare `host:port` (as literally specified) caused `bench new-site` to fail on Redis connection setup.
+
+## 2026-08-23 — Tier A Command Tests (test.local, frappe-v15)
+
+All commands run via `kubectl exec -n frappe-v15 bench-v15`, `cd /home/frappe/bench-data/frappe-bench` first.
+
+### A2: install-app — ⚡ Pass with modification
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  cd /home/frappe/bench-data/frappe-bench &&
+  bench --site test.local install-app frappe --force
+"
+...
+Installing frappe...
+Updating DocTypes for frappe        : [========================================] 100%
+Traceback (most recent call last):
+  ...
+  File ".../getpass.py", line 183, in _raw_input
+    raise EOFError
+builtins.EOFError:
+command terminated with exit code 1
+```
+**Failure cause:** `--force` on an app already installed on the site triggers an interactive Administrator-password reset prompt (`Set Administrator password:` / `Re-enter Administrator password:`). There's no non-interactive flag for this (`--help` shows only `--force`). A plain `kubectl exec` has no stdin, so `getpass` hits EOF immediately.
+
+**Modification:** used `kubectl exec -i` with the password piped twice via stdin:
+```
+$ printf "admin123\nadmin123\n" | kubectl exec -i -n frappe-v15 bench-v15 -- bash -c "
+  cd /home/frappe/bench-data/frappe-bench &&
+  bench --site test.local install-app frappe --force
+"
+...
+Updating DocTypes for frappe        : [========================================] 100%
+Warning: Password input may be echoed.
+Set Administrator password:
+Warning: Password input may be echoed.
+Re-enter Administrator password:
+
+Updating Dashboard for frappe
+```
+Result: exit 0, succeeded.
+
+### A4: migrate — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local migrate"
+Migrating test.local
+Updating DocTypes for frappe        : [========================================] 100%
+Updating Dashboard for frappe
+Executing `after_migrate` hooks...
+
+Queued rebuilding of search index for test.local
+```
+Exit 0, no modifications needed.
+
+### A6: backup — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local backup --with-files --verbose"
+set -o pipefail; /usr/bin/mariadb-dump --user=*** --host=mariadb.frappe-system.svc.cluster.local --port=3306 --password=********** ... | gzip >> ./test.local/private/backups/20260823_024659-test_local-database.sql.gz
+
+Backup Summary for test.local at 2026-08-23 02:46:59
+Config  : .../20260823_024659-test_local-site_config_backup.json  149.0B
+Database: .../20260823_024659-test_local-database.sql.gz          254.0KiB
+Public  : .../20260823_024659-test_local-files.tar                10.0KiB
+Private : .../20260823_024659-test_local-private-files.tar        10.0KiB
+Backup for Site test.local has been successfully completed with files
+```
+Exit 0, no modifications needed. (Bench's own output already redacts the DB password.)
+
+### A9: add-user — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  cd .../frappe-bench &&
+  bench --site test.local add-user testuser@test.com --first-name Test --last-name User --password ***REDACTED***
+"
+(no output)
+EXIT: 0
+```
+Command is silent on success — verified independently:
+```
+$ bench --site test.local execute frappe.client.get_list --kwargs '{"doctype": "User", "filters": {"name": "testuser@test.com"}}'
+[{"name": "testuser@test.com"}]
+```
+User confirmed created.
+
+### A7: maintenance-mode on — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local set-maintenance-mode on"
+(no output)
+EXIT: 0
+```
+Verified via `sites/test.local/site_config.json`: `"maintenance_mode": 1`.
+
+### A8: maintenance-mode off — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local set-maintenance-mode off"
+(no output)
+EXIT: 0
+```
+Verified via `site_config.json`: `"maintenance_mode": 0`.
+
+### A11: clear-cache — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local clear-cache"
+(no output)
+EXIT: 0
+```
+
+### A12: list-apps — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "cd .../frappe-bench && bench --site test.local list-apps"
+
+frappe 15.118.0 version-15
+```
+
+### Tier A Summary
+
+| ID | Command | Result | Notes |
+|---|---|---|---|
+| A2 | install-app --force | ⚡ Pass with modification | Needed `kubectl exec -i` + piped Administrator password (twice) — no non-interactive flag exists for the reset prompt |
+| A4 | migrate | ✅ Pass | — |
+| A6 | backup --with-files --verbose | ✅ Pass | — |
+| A9 | add-user | ✅ Pass | Silent on success; verified via `frappe.client.get_list` |
+| A7 | set-maintenance-mode on | ✅ Pass | Silent on success; verified via `site_config.json` |
+| A8 | set-maintenance-mode off | ✅ Pass | Silent on success; verified via `site_config.json` |
+| A11 | clear-cache | ✅ Pass | — |
+| A12 | list-apps | ✅ Pass | — |
+
+**7/8 passed cleanly, 1/8 passed with a required modification (A2).**
+
+## Decision Log
+
+### D1: MariaDB deployment method
+Question: How to deploy MariaDB 10.11 on k3s?
+Options considered:
+  - Bitnami Helm chart 12.2.9 → FAILED (image removed from free registry)
+  - Bitnami chart + official image override → FAILED (incompatible conventions)
+  - Native K8s manifests with official mariadb:10.11 image → ✅ CHOSEN
+Reason: Bitnami moved old tags to bitnamilegacy in 2025 restructuring.
+        Native manifests give full control and no registry dependency.
+
+### D2: Storage for bench pod
+Question: Ephemeral or persistent storage for bench pod?
+Options considered:
+  - Ephemeral (no PVC) → bench init takes 10min, lost on restart
+  - PVC (10Gi) → ✅ CHOSEN
+Reason: bench init clones repos and installs deps — too expensive to repeat.
+        PVC matches production pattern anyway.
+
+### D3: Redis host format
+Question: What format does Frappe expect for Redis hosts?
+Options considered:
+  - host:port (bare) → FAILED (ValueError: Redis URL must specify scheme)
+  - redis://host:port → ✅ CHOSEN
+Reason: Frappe v15 Redis client requires full URL scheme.
+        All bench set-redis-*-host commands must use redis:// prefix.
+
+### D4: bench init flags
+Question: What flags does bench init need in k3s environment?
+Options considered:
+  - bench init frappe-bench → FAILED (redis-server not found in image)
+  - bench init frappe-bench --skip-redis-config-generation → ✅ CHOSEN
+Reason: External Redis is used — no local redis-server binary exists in pod.
+        This flag is REQUIRED for all future bench init calls in k3s.
+
+### D5: MariaDB socket flag (deprecated)
+Question: How to allow remote MariaDB connections?
+Options considered:
+  - --no-mariadb-socket → Works but DEPRECATED in Frappe v15
+  - --mariadb-user-host-login-scope='%' → ✅ RECOMMENDED going forward
+Reason: --no-mariadb-socket still works but shows deprecation warning.
+        Future bench new-site calls should use the new flag.
+
+### D6: bench init target directory placement
+Question: Where should the PVC be mounted relative to the bench directory?
+Options considered:
+  - Mount PVC directly at .../frappe-bench → FAILED ("Bench instance already exists")
+  - Mount PVC one level up, bench init creates frappe-bench inside it → ✅ CHOSEN
+Reason: bench init requires its target directory to not already exist, since it
+        creates it itself. Mounting the PVC at the parent directory leaves the
+        target path free for bench init to create, while still persisting
+        everything underneath it.
+
+### D7: install-app --force on an already-installed app
+Question: How to run bench install-app --force non-interactively via kubectl exec?
+Options considered:
+  - kubectl exec (no stdin) → FAILED (EOFError on Administrator password prompt)
+  - kubectl exec -i with password piped twice via stdin → ✅ CHOSEN
+Reason: --force triggers an Administrator password reset with no CLI flag to
+        skip or supply it; kubectl exec -i plus a piped answer is the only
+        non-interactive workaround. Applies to any future --force install-app
+        or similar interactive-prompt bench command run via automation.
