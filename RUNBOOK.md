@@ -79,3 +79,35 @@ sudo visudo -c -f /etc/sudoers.d/frappe
 - Verified end-to-end from the operator machine: `ssh -i ssh-key-2026-08-22.key frappe@92.5.91.195` succeeds, and `sudo whoami` returns `root` with no password prompt.
 
 **Security note:** `frappe` now has full passwordless sudo and accepts the same key as `ubuntu`. This was requested explicitly for automation convenience; worth revisiting (e.g. scoping sudo rules, separate keys) once the k3s automation flows are defined.
+
+## 2026-08-22 — Phase 3: Security Hardening
+
+### Commands
+```
+# UFW firewall (rules added before enabling, to avoid SSH lockout)
+sudo ufw allow 22/tcp comment "SSH"
+sudo ufw allow 80/tcp comment "HTTP"
+sudo ufw allow 443/tcp comment "HTTPS"
+sudo ufw allow 6443/tcp comment "k3s API"
+sudo ufw --force enable
+
+# SSH hardening
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.20260822
+sudo sed -i \
+  -e "s/^#\?PermitRootLogin.*/PermitRootLogin no/" \
+  -e "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/" \
+  -e "s/^#\?PasswordAuthentication.*/PasswordAuthentication no/" \
+  /etc/ssh/sshd_config
+sudo sshd -t
+sudo systemctl restart ssh
+```
+
+### Results
+- **UFW:** enabled, default deny incoming / allow outgoing. Rules: 22/tcp (SSH), 80/tcp (HTTP), 443/tcp (HTTPS), 6443/tcp (k3s API) — all allowed for both IPv4 and IPv6.
+- **Pre-check:** found `/etc/ssh/sshd_config.d/60-cloudimg-settings.conf` already sets `PasswordAuthentication no` via the cloud-init default config, included before the relevant directives in the main file — no conflict with the changes made.
+- **sshd_config:** `PermitRootLogin no`, `PubkeyAuthentication yes`, `PasswordAuthentication no`. Backed up original to `/etc/ssh/sshd_config.bak.20260822` before editing. `sshd -t` passed syntax check before restart.
+- **Restart:** `systemctl restart ssh` → service active.
+- **Post-restart verification (fresh connections, not reused sessions):**
+  - `ubuntu` login via key → succeeds.
+  - `frappe` login via key + passwordless sudo → succeeds.
+  - `root` login via key → correctly rejected ("Permission denied (publickey)").
