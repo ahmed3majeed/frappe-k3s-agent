@@ -329,3 +329,53 @@ $ helm uninstall mariadb -n frappe-system
 release "mariadb" uninstalled
 ```
 Namespace left clean again. Stopping per instructions to confirm the path forward before continuing — flagged to user with concrete evidence (logs above) that "official image + Bitnami chart" is not a viable combination, recommending a native Kubernetes manifest (StatefulSet + Service + PVC + Secret) using `mariadb:10.11` instead.
+
+## 2026-08-22 — Step 4: Install MariaDB — Attempt 3 (native manifests, official image) — SUCCESS
+
+Per user decision: dropped the Bitnami Helm chart entirely and deployed MariaDB 10.11 with plain Kubernetes manifests using the official `mariadb:10.11` image, preserving the same configuration values from the original spec (10Gi persistence, `frappe` db/user, custom my.cnf tuning).
+
+### Manifests
+Written to `/home/frappe/manifests/mariadb/` (kept off the git repo — the Secret holds real credentials and this repo is public):
+- `secret.yaml` — `mariadb-secret` (root-password, password). Mode 600.
+- `configmap.yaml` — `mariadb-config`, mounted at `/etc/mysql/conf.d/custom.cnf`:
+  ```
+  [mysqld]
+  max_allowed_packet=128M
+  character-set-server=utf8mb4
+  collation-server=utf8mb4_unicode_ci
+  innodb_buffer_pool_size=256M
+  slow_query_log=1
+  ```
+- `statefulset.yaml` — 1 replica, image `mariadb:10.11`, env `MARIADB_ROOT_PASSWORD`/`MARIADB_DATABASE`/`MARIADB_USER`/`MARIADB_PASSWORD` sourced from the Secret, data volume at `/var/lib/mysql` via a 10Gi `volumeClaimTemplate` (`local-path` storage class), readiness/liveness probes via `mysqladmin ping`.
+- `service.yaml` — headless ClusterIP service `mariadb` on port 3306 (DNS: `mariadb.frappe-system.svc.cluster.local`, matches the original spec's service naming expectation).
+
+### Commands
+```
+kubectl apply -f /home/frappe/manifests/mariadb/secret.yaml
+kubectl apply -f /home/frappe/manifests/mariadb/configmap.yaml
+kubectl apply -f /home/frappe/manifests/mariadb/service.yaml
+kubectl apply -f /home/frappe/manifests/mariadb/statefulset.yaml
+kubectl rollout status statefulset/mariadb -n frappe-system --timeout=180s
+```
+
+### Result
+```
+secret/mariadb-secret created
+configmap/mariadb-config created
+service/mariadb created
+statefulset.apps/mariadb created
+partitioned roll out complete: 1 new pods have been updated...
+
+$ kubectl get pods -n frappe-system
+NAME        READY   STATUS    RESTARTS   AGE
+mariadb-0   1/1     Running   0          20s
+
+$ kubectl get pvc -n frappe-system
+NAME             STATUS   CAPACITY   ACCESS MODES   STORAGECLASS
+data-mariadb-0   Bound    10Gi       RWO            local-path
+
+$ kubectl get svc -n frappe-system
+NAME      TYPE        CLUSTER-IP   PORT(S)
+mariadb   ClusterIP   None         3306/TCP
+```
+MariaDB 10.11 is up and healthy. Connection test deferred to the Step 6 verification pass.
