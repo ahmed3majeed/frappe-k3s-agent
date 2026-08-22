@@ -55,3 +55,27 @@ sudo apt install -y curl wget git vim htop unzip \
 | software-properties-common | 0.99.22.9 |
 | net-tools | 1.60+git20181103.0eebece-1ubuntu5.4 |
 | ufw | 0.36.1 |
+
+## 2026-08-22 — Phase 2: Create Dedicated User
+
+### Commands
+```
+sudo useradd -m -d /home/frappe -s /bin/bash frappe
+sudo usermod -aG sudo frappe
+sudo mkdir -p /home/frappe/.ssh
+sudo cp /home/ubuntu/.ssh/authorized_keys /home/frappe/.ssh/authorized_keys
+sudo chown -R frappe:frappe /home/frappe/.ssh
+sudo chmod 700 /home/frappe/.ssh
+sudo chmod 600 /home/frappe/.ssh/authorized_keys
+echo "frappe ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/frappe
+sudo chmod 440 /etc/sudoers.d/frappe
+sudo visudo -c -f /etc/sudoers.d/frappe
+```
+
+### Results
+- User `frappe` created: `uid=1002(frappe) gid=1002(frappe) groups=1002(frappe),27(sudo)`, home `/home/frappe`, shell `/bin/bash`.
+- `/home/frappe/.ssh/authorized_keys` copied from `ubuntu`'s and confirmed identical (`diff` → no output). Permissions: `.ssh` = 700, `authorized_keys` = 600, both owned by `frappe:frappe`.
+- `/etc/sudoers.d/frappe` created with `frappe ALL=(ALL) NOPASSWD:ALL`, mode 440. `visudo -c` → "parsed OK".
+- Verified end-to-end from the operator machine: `ssh -i ssh-key-2026-08-22.key frappe@92.5.91.195` succeeds, and `sudo whoami` returns `root` with no password prompt.
+
+**Security note:** `frappe` now has full passwordless sudo and accepts the same key as `ubuntu`. This was requested explicitly for automation convenience; worth revisiting (e.g. scoping sudo rules, separate keys) once the k3s automation flows are defined.
