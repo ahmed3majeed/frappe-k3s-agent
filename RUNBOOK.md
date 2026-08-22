@@ -161,3 +161,67 @@ ssh frappe@92.5.91.195 whoami && sudo whoami
 - **UFW:** active and enabled on startup, same 4 rules intact (22, 80, 443, 6443 — tcp, v4+v6), default deny incoming.
 
 **Server fully verified post-reboot and ready for k3s installation.**
+
+## 2026-08-22 — k3s Installation
+
+### Commands
+```
+# Open kubelet port in UFW
+sudo ufw allow 10250/tcp comment "k3s kubelet"
+
+# Install k3s (latest stable channel, Traefik left enabled — default)
+curl -sfL https://get.k3s.io | sh -
+
+# Configure kubectl for frappe
+mkdir -p /home/frappe/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml /home/frappe/.kube/config
+sudo chown frappe:frappe /home/frappe/.kube/config
+chmod 600 /home/frappe/.kube/config
+echo "export KUBECONFIG=/home/frappe/.kube/config" >> /home/frappe/.bashrc
+```
+
+### Results
+- **UFW:** added `10250/tcp` (k3s kubelet), both v4/v6 — now 22, 80, 443, 6443, 10250 all allowed, default deny incoming otherwise.
+- **k3s installed:** version `v1.36.3+k3s1` (stable channel), arm64 binary, installed as user `frappe` (install script auto-escalated via `sudo`). Systemd unit `k3s.service` created, enabled, and started automatically.
+- **Traefik:** left enabled (no `--disable traefik` flag used) — running as the cluster Ingress Controller per requirements.
+- **kubectl:** `/usr/local/bin/kubectl` symlinked to the k3s binary by the installer. Kubeconfig copied from `/etc/rancher/k3s/k3s.yaml` to `/home/frappe/.kube/config` (chmod 600, owned by frappe), and `KUBECONFIG` exported in `frappe`'s `.bashrc`.
+
+### Verification
+
+**1. k3s service:**
+```
+$ sudo systemctl is-active k3s
+active
+$ sudo systemctl is-enabled k3s
+enabled
+```
+
+**2. Node status:**
+```
+$ kubectl get nodes -o wide
+NAME   STATUS   ROLES           AGE   VERSION        INTERNAL-IP   EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION              CONTAINER-RUNTIME
+test   Ready    control-plane   46s   v1.36.3+k3s1   10.0.0.37     <none>        Ubuntu 22.04.5 LTS   6.8.0-1059-oracle (arm64)   containerd://2.3.2-k3s2
+```
+
+**3. System pods (kube-system):**
+```
+NAME                                      READY   STATUS      RESTARTS      AGE
+coredns-54996dc9b4-f75gb                  1/1     Running     0             40s
+helm-install-traefik-crd-vsd8r            0/1     Completed   0             35s
+helm-install-traefik-s8wnl                0/1     Completed   1 (29s ago)   35s
+local-path-provisioner-58d557dc48-675gn   1/1     Running     0             40s
+metrics-server-6dc596dfb8-q9qsh           1/1     Running     0             38s
+svclb-traefik-de36e471-mxmr8              2/2     Running     0             26s
+traefik-59b7647586-ql68n                  1/1     Running     0             27s
+```
+All 4 required components confirmed Running: **coredns**, **traefik**, **local-path-provisioner**, **metrics-server**. (`helm-install-traefik-*` jobs show `Completed` — expected, they are one-shot jobs that install the Traefik Helm chart and exit 0 after success.)
+
+**4. Version:**
+```
+$ kubectl version
+Client Version: v1.36.3+k3s1
+Kustomize Version: v5.8.1
+Server Version: v1.36.3+k3s1
+```
+
+**k3s installation complete and fully verified.** Traefik is live as the Ingress Controller, ready for workload deployment.
