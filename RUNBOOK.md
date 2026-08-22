@@ -141,3 +141,23 @@ sudo systemctl restart ssh
 | **Reboot required** | **Yes** — pending kernel upgrade (6.8.0-1054 → 6.8.0-1059-oracle) from Phase 1. Not performed automatically; recommend scheduling before installing k3s. |
 
 **Server is ready for k3s installation**, pending the outstanding kernel reboot above.
+
+## 2026-08-22 — Reboot (apply pending kernel upgrade)
+
+### Commands
+```
+sudo reboot
+# ... wait for host to come back ...
+uname -r
+sudo ufw status verbose
+ssh frappe@92.5.91.195 whoami && sudo whoami
+```
+
+### Results
+- Pre-reboot kernel: `6.8.0-1054-oracle`. Rebooted to apply the kernel upgrade pending since Phase 1.
+- Server came back within ~10 seconds of the reboot command.
+- Post-reboot kernel: `6.8.0-1059-oracle` — upgrade applied successfully, `/var/run/reboot-required` cleared.
+- **SSH access:** both `ubuntu` and `frappe` verified via fresh key-based connections post-reboot; `frappe` passwordless sudo confirmed working (`sudo whoami` → `root`).
+- **UFW:** active and enabled on startup, same 4 rules intact (22, 80, 443, 6443 — tcp, v4+v6), default deny incoming.
+
+**Server fully verified post-reboot and ready for k3s installation.**
