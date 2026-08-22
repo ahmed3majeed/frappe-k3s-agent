@@ -111,3 +111,33 @@ sudo systemctl restart ssh
   - `ubuntu` login via key → succeeds.
   - `frappe` login via key + passwordless sudo → succeeds.
   - `root` login via key → correctly rejected ("Permission denied (publickey)").
+
+## 2026-08-22 — Phase 4: Verification Summary
+
+| Check | Result |
+|---|---|
+| OS version | Ubuntu 22.04.5 LTS (jammy) |
+| curl | 7.81.0 |
+| wget | 1.21.2 |
+| git | 2.34.1 |
+| vim | 8.2 |
+| htop | 3.0.5 |
+| unzip | 6.00 |
+| build-essential (gcc/make) | gcc 11.4.0 / GNU Make 4.3 |
+| apt-transport-https | 2.4.14 |
+| ca-certificates | 20260601~22.04.1 |
+| gnupg2 | 2.2.27 |
+| software-properties-common | 0.99.22.9 |
+| net-tools | 1.60+git20181103.0eebece-1ubuntu5.4 |
+| ufw | 0.36.1 |
+| frappe user | exists (uid 1002), groups: frappe, sudo |
+| frappe sudo | `(ALL : ALL) ALL` + `(ALL) NOPASSWD: ALL` — confirmed passwordless |
+| SSH: PermitRootLogin | no |
+| SSH: PasswordAuthentication | no |
+| SSH: PubkeyAuthentication | yes |
+| UFW status | active, default deny incoming |
+| UFW rules | 22, 80, 443, 6443 (tcp, v4+v6) allowed |
+| Uptime | up 31 min, load average 0.07/0.22/0.11 |
+| **Reboot required** | **Yes** — pending kernel upgrade (6.8.0-1054 → 6.8.0-1059-oracle) from Phase 1. Not performed automatically; recommend scheduling before installing k3s. |
+
+**Server is ready for k3s installation**, pending the outstanding kernel reboot above.
