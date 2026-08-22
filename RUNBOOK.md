@@ -379,3 +379,57 @@ NAME      TYPE        CLUSTER-IP   PORT(S)
 mariadb   ClusterIP   None         3306/TCP
 ```
 MariaDB 10.11 is up and healthy. Connection test deferred to the Step 6 verification pass.
+
+## 2026-08-22 — Step 5: Install Redis (3 instances)
+
+Installed via `bitnami/redis` Helm chart (no version pinned in spec, resolved to latest available: chart `28.0.10`, app version `8.10.1` — this chart line is on the currently-maintained free tier, unlike the older pinned MariaDB tag from Step 4, so no image availability issue here). Each instance: auth disabled, no persistence, standalone (0 replicas), distinct port for the master service.
+
+### Commands
+```
+helm install redis-cache bitnami/redis \
+  --namespace frappe-system \
+  --set auth.enabled=false \
+  --set master.persistence.enabled=false \
+  --set replica.replicaCount=0 \
+  --set master.service.ports.redis=6379 \
+  --wait --timeout 3m
+
+helm install redis-queue bitnami/redis \
+  --namespace frappe-system \
+  --set auth.enabled=false \
+  --set master.persistence.enabled=false \
+  --set replica.replicaCount=0 \
+  --set master.service.ports.redis=6380 \
+  --wait --timeout 3m
+
+helm install redis-socketio bitnami/redis \
+  --namespace frappe-system \
+  --set auth.enabled=false \
+  --set master.persistence.enabled=false \
+  --set replica.replicaCount=0 \
+  --set master.service.ports.redis=6381 \
+  --wait --timeout 3m
+```
+
+### Result
+All three deployed successfully (`STATUS: deployed`). Chart emitted standard warnings (rolling `:latest` tags on sub-images, no resource limits set) — informational only, not errors.
+
+```
+$ helm list -n frappe-system
+NAME            NAMESPACE       REVISION   STATUS     CHART           APP VERSION
+redis-cache     frappe-system   1          deployed   redis-28.0.10   8.10.1
+redis-queue     frappe-system   1          deployed   redis-28.0.10   8.10.1
+redis-socketio  frappe-system   1          deployed   redis-28.0.10   8.10.1
+
+$ kubectl get pods -n frappe-system
+NAME                      READY   STATUS    RESTARTS   AGE
+mariadb-0                 1/1     Running   0          2m43s
+redis-cache-master-0      1/1     Running   0          107s
+redis-queue-master-0      1/1     Running   0          68s
+redis-socketio-master-0   1/1     Running   0          30s
+```
+
+Service DNS names for connection testing:
+- `redis-cache-master.frappe-system.svc.cluster.local:6379`
+- `redis-queue-master.frappe-system.svc.cluster.local:6380`
+- `redis-socketio-master.frappe-system.svc.cluster.local:6381`
