@@ -225,3 +225,29 @@ Server Version: v1.36.3+k3s1
 ```
 
 **k3s installation complete and fully verified.** Traefik is live as the Ingress Controller, ready for workload deployment.
+
+## 2026-08-22 — Shared Infrastructure Namespace (frappe-system)
+
+### Step 1: Create Namespace
+```
+$ kubectl create namespace frappe-system
+namespace/frappe-system created
+```
+Verified: `kubectl get namespace frappe-system` → `Active`.
+
+### Step 2: Install Helm
+```
+$ curl -s https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+Downloading https://get.helm.sh/helm-v3.21.4-linux-arm64.tar.gz
+Verifying checksum... Done.
+helm installed into /usr/local/bin/helm
+```
+`helm version` → `v3.21.4` (checksum verified by the install script before install).
+
+### Step 3: Add Bitnami repo
+```
+$ helm repo add bitnami https://charts.bitnami.com/bitnami
+"bitnami" has been added to your repositories
+$ helm repo update
+Successfully got an update from the "bitnami" chart repository
+```
