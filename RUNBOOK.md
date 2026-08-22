@@ -251,3 +251,45 @@ $ helm repo add bitnami https://charts.bitnami.com/bitnami
 $ helm repo update
 Successfully got an update from the "bitnami" chart repository
 ```
+
+## 2026-08-22 — Step 4: Install MariaDB — FAILED (diagnosed, fix pending confirmation)
+
+### Version resolution
+Requested `--version 20.x.x` does not correspond to MariaDB app version 10.11 (chart 20.x installs MariaDB 11.4.x). Confirmed with user: prioritize the **MariaDB 10.11** requirement. Resolved chart version: **12.2.9** (app version 10.11.4), the latest Bitnami chart still on that MariaDB line.
+
+### Command
+```
+helm install mariadb bitnami/mariadb \
+  --namespace frappe-system \
+  --values /home/frappe/mariadb-values.yaml \
+  --version 12.2.9 \
+  --wait --timeout 5m
+```
+(`mariadb-values.yaml` written per spec: 10Gi persistence, utf8mb4 charset/collation, 256M innodb_buffer_pool_size, slow_query_log=1, database/user `frappe`. Credentials intentionally omitted from this document — see note below.)
+
+### Error
+```
+Error: INSTALLATION FAILED: context deadline exceeded
+```
+
+### Root cause (diagnosed via `kubectl describe pod`)
+```
+Warning  Failed  kubelet  Failed to pull image "docker.io/bitnami/mariadb:10.11.4-debian-11-r46":
+  rpc error: code = NotFound desc = ... not found
+```
+Pod stuck in `ImagePullBackOff`. Confirmed directly against Docker Hub's API:
+- `docker.io/bitnami/mariadb:10.11.4-debian-11-r46` → **HTTP 404** (removed)
+- `docker.io/bitnamilegacy/mariadb:10.11.4-debian-11-r46` → **HTTP 200** (exists)
+
+This matches Bitnami's 2025 catalog restructuring: older pinned image tags for non-latest chart versions were moved out of the free `bitnami` Docker Hub org into `bitnamilegacy`, while the Helm chart index itself was left unchanged (still references the old, now-missing tag). This affects any Bitnami chart pinned to an older app version, not just this one.
+
+### Cleanup
+```
+$ helm uninstall mariadb -n frappe-system
+release "mariadb" uninstalled
+```
+Namespace left clean; PVC/pod from the failed attempt removed. No workaround applied yet — awaiting confirmation on the fix below before retrying.
+
+**Proposed fix:** override the image registry to `bitnamilegacy` (same tag, same chart, same values) via `--set image.repository=bitnamilegacy/mariadb`, or pin an image on a chart version whose tag Bitnami still serves from the free `bitnami` org.
+
+**Note on credentials:** the values file (`/home/frappe/mariadb-values.yaml`, root/user passwords) is intentionally not reproduced verbatim in this document, since this repository is public on GitHub and this file lives only on the server (mode 600).
