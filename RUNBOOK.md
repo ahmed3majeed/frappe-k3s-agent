@@ -293,3 +293,39 @@ Namespace left clean; PVC/pod from the failed attempt removed. No workaround app
 **Proposed fix:** override the image registry to `bitnamilegacy` (same tag, same chart, same values) via `--set image.repository=bitnamilegacy/mariadb`, or pin an image on a chart version whose tag Bitnami still serves from the free `bitnami` org.
 
 **Note on credentials:** the values file (`/home/frappe/mariadb-values.yaml`, root/user passwords) is intentionally not reproduced verbatim in this document, since this repository is public on GitHub and this file lives only on the server (mode 600).
+
+## 2026-08-22 — Step 4: Install MariaDB — Attempt 2 (official image on Bitnami chart) — FAILED
+
+### Command
+```
+helm install mariadb bitnami/mariadb \
+  --namespace frappe-system \
+  --values /home/frappe/mariadb-values.yaml \
+  --version 12.2.9 \
+  --set image.registry=docker.io \
+  --set image.repository=library/mariadb \
+  --set image.tag=10.11 \
+  --wait --timeout 2m
+```
+
+### Error
+```
+Error: INSTALLATION FAILED: context deadline exceeded
+```
+Pod status: `CrashLoopBackOff`. Image pulled successfully this time (`docker.io/library/mariadb:10.11`, confirms the official image itself is fine), but the container crashes on every start:
+```
+2026-08-22 20:46:00 0 [Warning] Can't create test file '/var/lib/mysql/mariadb-0.lower-test' (Errcode: 13 "Permission denied")
+2026-08-22 20:46:00 0 [ERROR] mariadbd: Can't create/write to file './ddl_recovery.log' (Errcode: 13 "Permission denied")
+2026-08-22 20:46:00 0 [ERROR] DDL_LOG: Failed to create ddl log file: ./ddl_recovery.log
+2026-08-22 20:46:00 0 [ERROR] Aborting
+```
+
+### Root cause
+The Bitnami `mariadb` chart is built around Bitnami's own container conventions: a specific non-root UID via `securityContext`, a `/bitnami/mariadb`-style data path, and Bitnami-specific entrypoint/init scripts. The official `docker.io/library/mariadb` image expects to own `/var/lib/mysql` under its own user (root-managed `docker-entrypoint.sh`, different init flow). Simply overriding `image.*` on the Bitnami chart mixes incompatible conventions — the official image's process can't write to the volume because the Bitnami chart's pod security context sets the wrong filesystem ownership/UID for it. This is not a fixable config tweak on the Bitnami chart; the official image needs to be deployed with its own manifest (StatefulSet/Deployment), not through the Bitnami chart.
+
+### Cleanup
+```
+$ helm uninstall mariadb -n frappe-system
+release "mariadb" uninstalled
+```
+Namespace left clean again. Stopping per instructions to confirm the path forward before continuing — flagged to user with concrete evidence (logs above) that "official image + Bitnami chart" is not a viable combination, recommending a native Kubernetes manifest (StatefulSet + Service + PVC + Secret) using `mariadb:10.11` instead.
