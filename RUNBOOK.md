@@ -433,3 +433,51 @@ Service DNS names for connection testing:
 - `redis-cache-master.frappe-system.svc.cluster.local:6379`
 - `redis-queue-master.frappe-system.svc.cluster.local:6380`
 - `redis-socketio-master.frappe-system.svc.cluster.local:6381`
+
+## 2026-08-22 — Step 6: Verify Everything
+
+### MariaDB connection test
+Note: used the official `mariadb:10.11` image for the test client instead of `bitnami/mariadb:10.11` — the latter's specific pinned tags are gone from the free Bitnami org (see Step 4 failures above), and this image matches what was actually deployed.
+```
+$ kubectl run mariadb-test --rm --restart=Never --attach \
+  --image=mariadb:10.11 --namespace frappe-system \
+  -- mysql -h mariadb.frappe-system.svc.cluster.local -u root -p***REDACTED*** -e "SHOW DATABASES;"
+
+Database
+frappe
+information_schema
+mysql
+performance_schema
+sys
+pod "mariadb-test" deleted from frappe-system namespace
+```
+`frappe` database confirmed present.
+
+### Redis connection tests
+```
+$ kubectl run redis-test-cache ... -- redis-cli -h redis-cache-master.frappe-system.svc.cluster.local -p 6379 ping
+PONG
+
+$ kubectl run redis-test-queue ... -- redis-cli -h redis-queue-master.frappe-system.svc.cluster.local -p 6380 ping
+PONG
+
+$ kubectl run redis-test-socketio ... -- redis-cli -h redis-socketio-master.frappe-system.svc.cluster.local -p 6381 ping
+PONG
+```
+All three Redis instances respond correctly on their designated ports.
+
+### Summary: pods in frappe-system
+
+| Pod | Ready | Status | Restarts | Role |
+|---|---|---|---|---|
+| mariadb-0 | 1/1 | Running | 0 | Shared MariaDB 10.11 (native manifest, official image) |
+| redis-cache-master-0 | 1/1 | Running | 0 | Redis cache, port 6379 |
+| redis-queue-master-0 | 1/1 | Running | 0 | Redis queue, port 6380 |
+| redis-socketio-master-0 | 1/1 | Running | 0 | Redis socketio, port 6381 |
+
+**frappe-system namespace is fully verified and ready to back Frappe site deployments.**
+
+### Summary of deviations from the original spec
+1. **MariaDB Helm version** `20.x.x` → resolved to chart `12.2.9` (MariaDB 10.11.4), per explicit confirmation to prioritize the 10.11 requirement.
+2. **MariaDB delivery mechanism** Bitnami chart → dropped entirely in favor of native Kubernetes manifests with the official `mariadb:10.11` image, after two chart-based attempts failed (missing free-tier image tag, then incompatible container conventions when overriding just the image). Per explicit user decision.
+3. **Credentials** never committed to this public repo in plaintext — real values live only in `/home/frappe/mariadb-values.yaml` (chmod 600, unused after the pivot) and `/home/frappe/manifests/mariadb/secret.yaml` (chmod 600) on the server, and in the in-cluster `mariadb-secret` Kubernetes Secret.
