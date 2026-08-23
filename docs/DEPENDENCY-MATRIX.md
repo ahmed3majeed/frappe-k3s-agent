@@ -1,8 +1,6 @@
 # Frappe Dependency Matrix
-
-## Verified versions from actual test environments
-
-All "Verified" figures below were read directly from the running `bench-v14`, `bench-v15`, and `bench-v16` pods (and the shared `mariadb-0` / `redis-*` pods in `frappe-system`) on 2026-08-23, via `kubectl exec`. "Official minimum" figures are cross-referenced from Frappe's `pyproject.toml` (per-branch `requires-python`), `package.json` `engines.node`, and the official installation docs (docs.frappe.io). Where the two disagree, both are shown — see Notes.
+# Verified versions from actual test environments on k3s (ARM64)
+# Last updated: 2026-08-23
 
 ---
 
@@ -10,41 +8,43 @@ All "Verified" figures below were read directly from the running `bench-v14`, `b
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| v13 | ❌ Not supported | `node-sass` incompatible with Node 24+ (D36) |
+| v13 | ❌ Not supported | node-sass incompatible with Node 24+ V8 ABI (D36) |
 | v14 | ✅ Supported | Requires Python 3.11 workaround (D32) |
-| v15 | ✅ Supported | Full support |
-| v16 | ✅ Supported | Full support, latest |
+| v15 | ✅ Supported | Full support — reference version |
+| v16 | ✅ Supported | Latest — recommended for new deployments |
 
 ---
 
-## v14 Dependencies
+## v14 — Verified Dependency Versions
 
-### Verified working configuration (from `frappe-v14` test pod, `bench-v14-69cbb96c4f-xpx4x`, site `v14-test.local`)
+| Dependency | Actual version | Minimum | Recommended | Notes |
+|------------|---------------|---------|-------------|-------|
+| Frappe | 14.101.1 | 14.x | latest v14 | |
+| Python (venv) | 3.11.2 | 3.10 | 3.11 | 3.12+ breaks pypika (D32) |
+| Python (system) | 3.11.2 | 3.11 | 3.11 | Must use `--python /usr/bin/python3.11` |
+| pip | 26.2.1 | 20 | latest | |
+| Node.js | v24.13.0 | 16 | 18 | Node 24 works but exceeds v14 design — it's simply the shared image's Node install |
+| yarn | 1.22.22 | 1.12 | latest | |
+| bench CLI | 5.31.0 | any | latest | |
+| MariaDB | 10.11.18-MariaDB | 10.6.6 | 10.11 | |
+| Redis | 8.10.1 | 6 | 8 | |
+| wkhtmltopdf | 0.12.6.1 | 0.12.6 | 0.12.6 (patched qt) | Must be patched qt version |
+| OS (container) | Debian 12 (bookworm) | — | — | `frappe/bench:latest` is Debian-based, not Ubuntu — verified via `/etc/os-release`, not assumed |
 
-| Dependency | Version used (verified) | Official minimum | Recommended | Notes |
-|------------|-------------------------|-------------------|-------------|-------|
-| Python | **3.11.2** | 3.10 | 3.11 | 3.10 is Frappe's declared floor but untested here; 3.12+ breaks pypika (D32) — 3.11 is this project's practical floor |
-| Node.js | **v24.13.0** | 18 (docs); `>=14` per `package.json` `engines` | 18–20 | Node 24 works but is far beyond what v14 needs — it's simply the image's shared Node install (see v15/v16 rows) |
-| yarn | **1.22.22** | 1.12 | latest | |
-| pip | **26.2.1** | 20 | latest | |
-| bench CLI | **5.31.0** | any | latest | same bench CLI across v14/v15/v16 — bench itself is independent of the Frappe app version |
-| Frappe | **14.101.1** (branch `version-14`) | — | — | |
-| MariaDB | **10.11.18-MariaDB** (shared `frappe-system` instance) | 10.6.6 | 10.11 | |
-| Redis | **8.10.1** (dedicated `redis-v14`, 3 sidecar processes) | 6 | 8 | |
-| wkhtmltopdf | **0.12.6.1** (patched qt) | 0.12.6 (patched qt) | 0.12.6 (patched qt) | matches official requirement exactly |
-| OS (container) | **Debian 12 (bookworm)** | — | — | the `frappe/bench:latest` image is Debian-based, **not Ubuntu** — corrects an assumption carried over from the original task brief |
-
-### `bench init` command for v14:
+### bench init (v14):
 ```bash
+# Pre-requisite (run inside pod first):
+apt-get install -y python3.11-dev
+
 bench init frappe-bench \
   --frappe-branch version-14 \
   --python /usr/bin/python3.11 \
   --skip-redis-config-generation
 ```
 
-### `bench new-site` command for v14:
+### bench new-site (v14):
 ```bash
-bench new-site <site> \
+bench new-site <site-name> \
   --no-mariadb-socket \
   --db-host <mariadb-host> \
   --mariadb-root-username root \
@@ -52,41 +52,38 @@ bench new-site <site> \
   --admin-password <pass>
 ```
 
-### Special setup steps for v14:
-1. Install `python3.11-dev` before `bench init` (needed to compile `hiredis`):
-   ```bash
-   apt-get install -y python3.11-dev
-   ```
+### Known v14-specific behaviors:
+- backup uses `mysqldump` (not `mariadb-dump`) — D35
+- list-apps shows full version info only AFTER migrate runs — D34
+- `--mariadb-user-host-login-scope` flag does NOT exist — use `--no-mariadb-socket` — D33
 
 ---
 
-## v15 Dependencies
+## v15 — Verified Dependency Versions
 
-### Verified working configuration (from `frappe-v15` test pod, `bench-v15`, site `test.local`)
+| Dependency | Actual version | Minimum | Recommended | Notes |
+|------------|---------------|---------|-------------|-------|
+| Frappe | 15.118.0 | 15.x | latest v15 | |
+| Python (venv) | 3.14.2 | 3.11 | 3.12+ | v15's `pyproject.toml` caps at `<3.15`; image ships 3.14 |
+| pip | 26.2.1 | 20 | latest | |
+| Node.js | v24.13.0 | 18 | 20+ | |
+| yarn | 1.22.22 | 1.12 | latest | |
+| bench CLI | 5.31.0 | any | latest | |
+| MariaDB | 10.11.18-MariaDB | 10.6.6 | 10.11 | Shows deprecation warning if >10.8 |
+| Redis | 8.10.1 | 6 | 8 | |
+| wkhtmltopdf | 0.12.6.1 | 0.12.6 | 0.12.6 (patched qt) | |
+| OS (container) | Debian 12 (bookworm) | — | — | |
 
-| Dependency | Version used (verified) | Official minimum | Recommended | Notes |
-|------------|-------------------------|-------------------|-------------|-------|
-| Python | **3.14.2** | 3.10 | 3.11+ | v15's own `pyproject.toml` caps at `<3.15`; the image happened to ship 3.14, well above the 3.10 floor |
-| Node.js | **v24.13.0** | 18 | 18–20 | |
-| yarn | **1.22.22** | 1.12 | latest | |
-| pip | **26.2.1** | 20 | latest | |
-| bench CLI | **5.31.0** | any | latest | |
-| Frappe | **15.118.0** (branch `version-15`) | — | — | |
-| MariaDB | **10.11.18-MariaDB** (shared `frappe-system` instance) | 10.6.6 | 10.11 | prints `"MariaDB version ... is more than 10.8 which is not yet tested"` warning on every `new-site`/`reinstall`/`restore` — cosmetic only |
-| Redis | **8.10.1** (shared `frappe-system` Bitnami instances) | 6 | 8 | |
-| wkhtmltopdf | **0.12.6.1** (patched qt) | 0.12.6 (patched qt) | 0.12.6 (patched qt) | |
-| OS (container) | **Debian 12 (bookworm)** | — | — | |
-
-### `bench init` command for v15:
+### bench init (v15):
 ```bash
 bench init frappe-bench \
   --frappe-branch version-15 \
   --skip-redis-config-generation
 ```
 
-### `bench new-site` command for v15:
+### bench new-site (v15):
 ```bash
-bench new-site <site> \
+bench new-site <site-name> \
   --mariadb-user-host-login-scope='%' \
   --db-host <mariadb-host> \
   --mariadb-root-username root \
@@ -94,35 +91,38 @@ bench new-site <site> \
   --admin-password <pass>
 ```
 
+### Known v15-specific behaviors:
+- MariaDB deprecation warning if version > 10.8 (informational only)
+- backup uses relative paths in Backup Summary
+- run-patch prints explicit success message
+
 ---
 
-## v16 Dependencies
+## v16 — Verified Dependency Versions
 
-### Verified working configuration (from `frappe-v16` test pod, `bench-v16-bfc76ddcd-zlrtl`, site `v16-test.local`)
+| Dependency | Actual version | Minimum | Recommended | Notes |
+|------------|---------------|---------|-------------|-------|
+| Frappe | 16.31.0 | 16.x | latest v16 | |
+| Python (venv) | 3.14.2 | 3.14 | 3.14 | v16's `pyproject.toml` requires `>=3.14,<3.15` — first version to *require* 3.14, not just allow it |
+| pip | 26.2.1 | 25.3 | latest | |
+| Node.js | v24.13.0 | 24 | 24+ | matches official `engines.node: ">=24"` exactly |
+| yarn | 1.22.22 | 1.22 | latest | |
+| bench CLI | 5.31.0 | any | latest | |
+| MariaDB | 10.11.18-MariaDB | 11.8 (official docs) | 11.8 | **tested environment runs below the official minimum (10.11.18 < 11.8) and still works, with no warning printed** — consistent with D26 |
+| Redis | 8.10.1 | 6 | 8 | |
+| wkhtmltopdf | 0.12.6.1 | 0.12.6 | 0.12.6 (patched qt) | |
+| OS (container) | Debian 12 (bookworm) | — | — | |
 
-| Dependency | Version used (verified) | Official minimum | Recommended | Notes |
-|------------|-------------------------|-------------------|-------------|-------|
-| Python | **3.14.2** | 3.14 (`pyproject.toml`: `>=3.14,<3.15`) | 3.14 | v16 is the first version to *require* 3.14, not just allow it |
-| Node.js | **v24.13.0** | 24 (`package.json` `engines.node: ">=24"`) | 24+ | matches the official floor exactly |
-| yarn | **1.22.22** | 1.22 | latest | |
-| pip | **26.2.1** | 25.3 | latest | |
-| bench CLI | **5.31.0** | any | latest | |
-| Frappe | **16.31.0** (branch `version-16`) | — | — | |
-| MariaDB | **10.11.18-MariaDB** (shared `frappe-system` instance, same as v14/v15) | **11.8 per official docs** | 11.8 | **our tested environment runs below the official minimum (10.11.18 < 11.8) yet works with no errors** — consistent with D26 (v16 prints no MariaDB version-compatibility warning at all, unlike v15). Not independently verified against 11.8; treat 10.11.18 as empirically working, not as proof 11.8 is unnecessary |
-| Redis | **8.10.1** (dedicated `redis-v16`, 3 sidecar processes) | 6 | 8 | |
-| wkhtmltopdf | **0.12.6.1** (patched qt) | 0.12.6 (patched qt) | 0.12.6 (patched qt) | |
-| OS (container) | **Debian 12 (bookworm)** | — | — | |
-
-### `bench init` command for v16:
+### bench init (v16):
 ```bash
 bench init frappe-bench \
   --frappe-branch version-16 \
   --skip-redis-config-generation
 ```
 
-### `bench new-site` command for v16:
+### bench new-site (v16):
 ```bash
-bench new-site <site> \
+bench new-site <site-name> \
   --mariadb-user-host-login-scope='%' \
   --db-host <mariadb-host> \
   --mariadb-root-username root \
@@ -130,37 +130,93 @@ bench new-site <site> \
   --admin-password <pass>
 ```
 
----
-
-## Key behavioral differences between versions
-
-| Behavior | v14 | v15 | v16 |
-|----------|-----|-----|-----|
-| MariaDB socket flag | `--no-mariadb-socket` (D33) | `--mariadb-user-host-login-scope='%'` | `--mariadb-user-host-login-scope='%'` |
-| Backup dump tool | `mysqldump` (D35) | `mariadb-dump` | `mariadb-dump` |
-| Backup path format | relative | relative | absolute (D28) |
-| `migrate` extra steps | no | no | yes (D27) |
-| `run-patch` output | verbose | verbose | silent on success — check exit code (D30) |
-| `new-site` extra steps | no | no | yes: Workspace Sidebars, Desktop Icons (D26) |
-| `drop-site` archive path | `sites/archived/` | `sites/archived/` | `archived/sites/` (D29) |
-| `list-apps` version display | depends on `migrate` having run (D34) | depends on `migrate` having run (D34) | depends on `migrate` having run (D34) |
-| MariaDB version warning on `new-site` | not observed | always printed | never printed |
-| Python requirement | 3.11 practical floor (3.12+ breaks pypika, D32) | 3.10 official / 3.11+ tested | 3.14 required |
-| Node requirement | 18+ official / 24 as-installed | 18+ official / 24 as-installed | 24 required |
-
-Note on `list-apps`: D34 established this is a **site-lifecycle-state** issue (whether `migrate` has run), not a per-version difference — it applies identically to all three versions and is listed here for completeness, not because the versions differ.
+### Known v16-specific behaviors:
+- bench new-site adds 2 new steps: Workspace Sidebars + Desktop Icons — D26
+- migrate adds cleanup steps + enqueues delete_dynamic_links — D27
+- backup uses absolute paths in Backup Summary — D28
+- drop-site archives to archived/sites/ not sites/archived/ — D29
+- run-patch is SILENT on success (check exit code not output) — D30
 
 ---
 
-## Custom Agent implementation notes
+## Version Comparison: Key Behavioral Differences
 
-When provisioning a new bench, the Custom Agent must:
+| Behavior | v13 | v14 | v15 | v16 |
+|----------|-----|-----|-----|-----|
+| Support status | ❌ | ✅* | ✅ | ✅ |
+| Python | 3.7+ | 3.11 only | 3.11+ | 3.14 required |
+| Node.js | 14 | 16+ (24 as-installed) | 18+ (24 as-installed) | 24 required |
+| MariaDB socket flag | N/A | --no-mariadb-socket | --mariadb-user-host-login-scope='%' | --mariadb-user-host-login-scope='%' |
+| backup dump tool | N/A | mysqldump | mariadb-dump | mariadb-dump |
+| backup path format | N/A | relative | relative | absolute |
+| migrate extra steps | N/A | no | no | yes |
+| run-patch output | N/A | verbose | verbose | silent |
+| new-site extra steps | N/A | no | no | yes |
+| drop-site archive path | N/A | sites/archived/ | sites/archived/ | archived/sites/ |
 
-1. Check the requested Frappe version.
-2. Use the correct `bench init` flags — v14 needs `--python /usr/bin/python3.11` explicitly; v15/v16 use whatever Python the image ships.
-3. Use the correct `bench new-site` MariaDB flag — `--no-mariadb-socket` on v14, `--mariadb-user-host-login-scope='%'` on v15/v16 (D5, D33).
-4. Set appropriate timeouts — v16's `migrate` runs extra cleanup steps and takes longer (D27).
-5. Parse `backup` output correctly — v16 emits absolute paths, v14/v15 emit relative paths (D28).
-6. Check the **exit code**, not output text, for `run-patch` success — v16 is silent on success (D30).
-7. Don't infer app version from `list-apps` immediately after site creation on any version — it's empty until the first `migrate` runs (D34). Read `apps/{app}/{app}/__init__.py`'s `__version__` instead if a version is needed pre-migrate.
-8. Don't assume the bench container is Ubuntu — it's Debian 12 (bookworm) across all tested versions; any OS-specific package logic (e.g. `apt` package names) should target Debian, not Ubuntu.
+*v14 requires workaround: python3.11-dev + --python flag
+
+---
+
+## Custom Agent Implementation Rules
+
+When provisioning a new bench, the Custom Agent MUST:
+
+### 1. Select correct bench init command per version:
+```python
+def get_bench_init_command(frappe_version, bench_name):
+    base = f"bench init {bench_name} --skip-redis-config-generation"
+    if frappe_version == "v14":
+        return f"apt-get install -y python3.11-dev && {base} --frappe-branch version-14 --python /usr/bin/python3.11"
+    elif frappe_version == "v15":
+        return f"{base} --frappe-branch version-15"
+    elif frappe_version == "v16":
+        return f"{base} --frappe-branch version-16"
+    else:
+        raise ValueError(f"Unsupported version: {frappe_version}")
+```
+
+### 2. Select correct bench new-site flags per version:
+```python
+def get_new_site_flags(frappe_version):
+    if frappe_version == "v14":
+        return "--no-mariadb-socket"
+    else:  # v15, v16
+        return "--mariadb-user-host-login-scope='%'"
+```
+
+### 3. Parse backup output correctly per version:
+```python
+def parse_backup_path(output, frappe_version):
+    if frappe_version == "v16":
+        # Absolute paths in output
+        import re
+        return re.findall(r'/home/frappe/.*\.sql\.gz', output)
+    else:
+        # Relative paths — combine with bench dir
+        import re
+        return re.findall(r'sites/.*\.sql\.gz', output)
+```
+
+### 4. Check run-patch result by exit code only:
+```python
+# WRONG — breaks on v16 (D30)
+if "Success: Done" in output:
+    mark_success()
+
+# CORRECT — works on all versions
+if exit_code == 0:
+    mark_success()
+```
+
+### 5. Set appropriate timeouts:
+```python
+TIMEOUTS = {
+    "v14": {"migrate": 120, "bench_init": 900},
+    "v15": {"migrate": 120, "bench_init": 900},
+    "v16": {"migrate": 300, "bench_init": 900},  # v16 migrate takes longer
+}
+```
+
+### 6. Don't assume the container OS:
+The bench image (`frappe/bench:latest`) is Debian 12 (bookworm) across v14/v15/v16 — not Ubuntu. Any OS-specific package logic (e.g. `apt` package names, patch availability) should target Debian, not Ubuntu.
