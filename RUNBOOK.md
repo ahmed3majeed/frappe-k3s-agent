@@ -1794,3 +1794,33 @@ bench-v15    1/1   Running   4h21m
 | N3 Full cleanup | ✅ Pass |
 
 **3/3 clean.** The archive/restore pattern (PVC survives independent of Deployment/Service lifecycle) is the direct K8s equivalent of Docker's "stop the container, keep the bind-mounted data, `docker rm`" pattern — confirmed working with a real bench, not just an empty volume.
+
+## 2026-08-23 — Phase 2, GROUP O: Agent Self-Update Concept
+
+Replaces `git reset --hard && git fetch && git merge && supervisorctl restart agent:*`.
+
+### O1: Simulate image update (as originally specified) — ✅ Pass (fallback path)
+```
+$ kubectl set image deployment/bench-test bench=frappe/bench:latest -n frappe-test 2>/dev/null || echo "Deployment already deleted — concept verified"
+Deployment already deleted — concept verified
+```
+`bench-test`/`frappe-test` no longer existed by this point (deleted in Group N), so this correctly hit the documented fallback branch.
+
+### O1 (supplementary): live demonstration of the actual mechanism
+To get real evidence beyond the fallback branch, spun up a disposable `demo-agent` deployment (`busybox:1.36`) in a throwaway `frappe-o-test` namespace:
+```
+$ kubectl set image deployment/demo-agent busybox=busybox:1.35 -n frappe-o-test
+deployment.apps/demo-agent image updated
+$ kubectl rollout status deployment/demo-agent -n frappe-o-test --timeout=30s
+deployment "demo-agent" successfully rolled out
+```
+Image confirmed changed: `busybox:1.36` → `busybox:1.35`. Namespace deleted immediately after (was never meant to persist).
+
+**Conclusion:** in K8s, Agent self-update is genuinely just `kubectl set image deployment/{agent} {container}={new-image}:{tag}` + a rollout wait — no `git pull`, no `supervisorctl restart`. The new image is baked ahead of time (via CI/registry push), and the rollout mechanism K8s already provides (rolling update, one-old-pod-at-a-time replacement) replaces what `supervisorctl restart agent:*` used to do manually.
+
+### GROUP O Summary
+
+| Step | Result |
+|---|---|
+| O1 (as-specified, fallback) | ✅ Pass |
+| O1 (live mechanism demo) | ✅ Pass |
