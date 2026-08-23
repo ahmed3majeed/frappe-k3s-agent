@@ -1364,3 +1364,61 @@ Site fully healthy after all Group A tests.
 | ⚡ Pass with modification/caveat | 5 |
 | ❌ Fail | 3 |
 | **Total tested this session** | **30** (+3 backfilled) |
+
+## 2026-08-23 — Master Command List: GROUP B (git commands, in-pod)
+
+All commands run via `kubectl exec` inside `bench-v15`, targeting `apps/frappe` (a shallow `--depth 1` clone, remote named `upstream`, branch `version-15`). State recorded first (`git status --short` clean, `git log --oneline -5` → single commit `9b8d265`). Any command switching commits was checked back out to `version-15` afterward, and `git clean -fd` was previewed with `-n` before running for real (found nothing to clean either time — working tree was already clean).
+
+### Results
+
+| Command | Result | Notes |
+|---|---|---|
+| `git rev-parse HEAD` | ✅ Pass | `9b8d265b27a1dfb11c7aef21a533a127e14a0a5a` |
+| `git remote get-url {remote}` | ✅ Pass | `upstream` → `https://github.com/frappe/frappe.git` |
+| `git remote add {remote} {url}` | ✅ Pass | Added `test-remote`, confirmed via `git remote -v` |
+| `git remote remove {remote}` | ✅ Pass | Removed `test-remote` cleanly |
+| `git fetch --depth 2 {remote} {branch}` | ✅ Pass | Used to pull a second commit into a shallow clone (`FETCH_HEAD` → 2 commits) |
+| `git fetch --depth 1 {remote} {hash}` | ⚡ Pass with modification | **Abbreviated hash fails:** `git fetch --depth 1 upstream 16d483c` → `fatal: couldn't find remote ref 16d483c`. GitHub's server-side SHA-fetch only resolves **full 40-character SHAs**, not short ones. Retried with `git fetch --depth 1 upstream 16d483c2095d57a080c664dba3e19a0421739719` → succeeded. **The real Agent must always pass the full SHA, never an abbreviated one, to this command.** |
+| `git diff --name-only {old} {new}` | ✅ Pass | Between the two fetched commits → `frappe/__init__.py` (the version-bump commit) |
+| `git diff --name-only {old} {new} -- '*.vue' '*.js'` | ✅ Pass | Empty result (no frontend files changed in that commit) — correct |
+| `git diff --name-only {old} {new} -- requirements.txt pyproject.toml` | ✅ Pass | Empty result — correct |
+| `git reset --hard {hash}` | ✅ Pass | Used current `HEAD` — no-op, safe |
+| `git clean -fd` | ✅ Pass | Previewed with `-n` first (empty — nothing to clean), then ran for real (also empty) |
+| `git checkout {hash}` | ✅ Pass | Detached HEAD at the old commit, confirmed via `git log --oneline -1` |
+| (recovery) `git checkout version-15` | ✅ Pass | Back on branch, `up to date with 'upstream/version-15'` |
+| `git -C {app_path} rev-parse HEAD` | ✅ Pass | Run from bench root (not cd'd into the app dir) — confirms `-C` works without a prior `cd` |
+| `git -C {app_path} fetch --depth 1 {url} {hash}` | ✅ Pass | Used the full clone URL directly instead of a named remote — also works |
+| `git -C {app_path} reset --hard HEAD` | ✅ Pass | — |
+| `git -C {app_path} clean -fd` | ✅ Pass | — |
+| `git -C {app_path} checkout {hash}` | ✅ Pass | Detached, then checked back out to `version-15` |
+| `git -C {app_path} diff --name-only {old} {new} -- '*.vue' '*.js'` | ✅ Pass | Empty (correct) |
+| `git -C {app_path} diff --name-only {old} {new} -- requirements.txt pyproject.toml` | ✅ Pass | Empty (correct) |
+
+### "New bench setup" git sequence (tested in an isolated `/tmp/scratch-git-test` directory, not the real app checkout)
+
+| Command | Result | Notes |
+|---|---|---|
+| `git init` | ✅ Pass | (Prints a default-branch-name hint, harmless) |
+| `git remote add origin {url}` | ✅ Pass | — |
+| `git config credential.helper ''` | ✅ Pass | Disables credential prompting for this repo |
+| `git fetch --depth 1 origin {hash}` | ✅ Pass | Full SHA, as established above |
+| `git checkout -B {branch}` | ✅ Pass | `git checkout -B version-15 FETCH_HEAD` → new local branch tracking the fetched commit, confirmed via `log`/`branch --show-current` |
+
+This full 5-command sequence is exactly how a bench-less "clone at a specific commit" would work — verified end-to-end. Scratch directory removed after testing.
+
+### Final state check
+```
+$ git -C apps/frappe status --short
+(clean)
+$ git -C apps/frappe branch --show-current
+version-15
+```
+
+### GROUP B Summary
+
+| Result | Count |
+|---|---|
+| ✅ Pass | 20 |
+| ⚡ Pass with modification | 1 (full-SHA requirement on hash-based fetch) |
+| ❌ Fail | 0 |
+| **Total** | **21 / 21** |
