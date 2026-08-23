@@ -774,65 +774,46 @@ frappe 15.118.0 version-15
 ## Decision Log
 
 ### D1: MariaDB deployment method
-Question: How to deploy MariaDB 10.11 on k3s?
-Options considered:
-  - Bitnami Helm chart 12.2.9 → FAILED (image removed from free registry)
-  - Bitnami chart + official image override → FAILED (incompatible conventions)
-  - Native K8s manifests with official mariadb:10.11 image → ✅ CHOSEN
-Reason: Bitnami moved old tags to bitnamilegacy in 2025 restructuring.
-        Native manifests give full control and no registry dependency.
+**Discovered in:** Phase 1, frappe-system setup (MariaDB installation)
+**Finding:** Three approaches were tried for deploying MariaDB 10.11: (1) Bitnami Helm chart 12.2.9 — FAILED, the pinned image tag was removed from the free `bitnami` Docker Hub org in their 2025 catalog restructuring; (2) Bitnami chart with the official `mariadb` image swapped in — FAILED, the chart's security context/volume conventions are Bitnami-specific and don't fit the official image (permission errors); (3) native Kubernetes manifests (Secret + ConfigMap + StatefulSet + Service) with the official `mariadb:10.11` image — SUCCEEDED.
+**Impact on Custom Agent:** relying on the Bitnami MariaDB chart is a registry-availability risk — pinned image tags can silently disappear from the free tier. A chart-based install can also fail non-obviously when mixing chart conventions with a different base image.
+**Implementation rule:** deploy MariaDB via native Kubernetes manifests referencing the official `mariadb:{version}` image directly, not the Bitnami chart. This gives full control over image source and avoids third-party registry/catalog dependency risk entirely.
 
 ### D2: Storage for bench pod
-Question: Ephemeral or persistent storage for bench pod?
-Options considered:
-  - Ephemeral (no PVC) → bench init takes 10min, lost on restart
-  - PVC (10Gi) → ✅ CHOSEN
-Reason: bench init clones repos and installs deps — too expensive to repeat.
-        PVC matches production pattern anyway.
+**Discovered in:** Phase 1, bench-v15 pod setup
+**Finding:** `bench init` clones the full Frappe framework, builds a Python virtualenv, and installs Node dependencies — a 5-10+ minute operation. Without persistent storage, any pod restart loses all of this and forces a full re-init from scratch.
+**Impact on Custom Agent:** an ephemeral (PVC-less) bench pod is unusable in practice — any restart, rescheduling, or node failure wipes the entire bench, forcing a lengthy rebuild before the site is usable again.
+**Implementation rule:** every bench pod must mount a PersistentVolumeClaim (10Gi minimum for a single-app bench) for its bench directory. This also matches real production deployment patterns, where bench state must survive pod lifecycle events.
 
-### D3: Redis host format
-Question: What format does Frappe expect for Redis hosts?
-Options considered:
-  - host:port (bare) → FAILED (ValueError: Redis URL must specify scheme)
-  - redis://host:port → ✅ CHOSEN
-Reason: Frappe v15 Redis client requires full URL scheme.
-        All bench set-redis-*-host commands must use redis:// prefix.
+### D3: Redis hosts need `redis://` prefix, not bare `host:port`
+**Discovered in:** Phase 1, bench-v15 `bench new-site` (initial infrastructure host configuration)
+**Finding:** `bench set-redis-cache-host` / `-queue-host` / `-socketio-host` accept a bare `host:port` value without complaint and write it to `common_site_config.json`, but `bench new-site` then fails when it actually tries to connect: `ValueError: Redis URL must specify one of the following schemes (redis://, rediss://, unix://)`. Frappe v15's Redis client (via the `redis` Python package) requires a full URL with scheme, not a bare host:port.
+**Impact on Custom Agent:** any automation that writes Redis host config using bare `host:port` (as the Redis service DNS name naturally looks) will pass the `set-redis-*-host` step silently, then fail later at `bench new-site`/`bench migrate` with a confusing error far removed from the actual misconfiguration.
+**Implementation rule:** always prefix Redis host values with `redis://` — e.g. `bench set-redis-cache-host redis://redis-cache-master.frappe-system.svc.cluster.local:6379`, never the bare `host:port` form.
 
-### D4: bench init flags
-Question: What flags does bench init need in k3s environment?
-Options considered:
-  - bench init frappe-bench → FAILED (redis-server not found in image)
-  - bench init frappe-bench --skip-redis-config-generation → ✅ CHOSEN
-Reason: External Redis is used — no local redis-server binary exists in pod.
-        This flag is REQUIRED for all future bench init calls in k3s.
+### D4: `bench init` requires `--skip-redis-config-generation`
+**Discovered in:** Phase 1, bench-v15 `bench init`
+**Finding:** By default, `bench init` tries to generate a local Redis config, which shells out to a local `redis-server` binary to check its version. The `frappe/bench:latest` image has no `redis-server` binary installed (Redis runs as a separate service in `frappe-system`, not locally in the bench pod), so plain `bench init frappe-bench` fails: `/bin/sh: 1: redis-server: not found`, followed by a full traceback and installation rollback.
+**Impact on Custom Agent:** every `bench init` call in this k3s architecture (external Redis, not a local one) will fail outright without this flag — this isn't an edge case, it's the default/expected topology for every bench the Agent creates.
+**Implementation rule:** always pass `--skip-redis-config-generation` to `bench init` in this environment: `bench init {name} --frappe-branch {branch} --skip-redis-config-generation`.
 
-### D5: MariaDB socket flag (deprecated)
-Question: How to allow remote MariaDB connections?
-Options considered:
-  - --no-mariadb-socket → Works but DEPRECATED in Frappe v15
-  - --mariadb-user-host-login-scope='%' → ✅ RECOMMENDED going forward
-Reason: --no-mariadb-socket still works but shows deprecation warning.
-        Future bench new-site calls should use the new flag.
+### D5: `--no-mariadb-socket` is deprecated in Frappe v15
+**Discovered in:** Phase 1, bench-v15 `bench new-site` / `bench reinstall`
+**Finding:** `bench new-site --no-mariadb-socket ...` still works, but Frappe v15 prints a deprecation warning: `--no-mariadb-socket is DEPRECATED; use --mariadb-user-host-login-scope='%' ... instead. The name of this option was misleading; it had nothing to do with sockets.` Functionally equivalent, but the old flag is on a deprecation path.
+**Impact on Custom Agent:** using the deprecated flag works today but risks breaking in a future Frappe version once the flag is actually removed, and produces noisy deprecation output in every `bench new-site` call the Agent makes.
+**Implementation rule:** use `--mariadb-user-host-login-scope='%'` instead of `--no-mariadb-socket` in all `bench new-site` (and equivalent) invocations going forward.
 
-### D6: bench init target directory placement
-Question: Where should the PVC be mounted relative to the bench directory?
-Options considered:
-  - Mount PVC directly at .../frappe-bench → FAILED ("Bench instance already exists")
-  - Mount PVC one level up, bench init creates frappe-bench inside it → ✅ CHOSEN
-Reason: bench init requires its target directory to not already exist, since it
-        creates it itself. Mounting the PVC at the parent directory leaves the
-        target path free for bench init to create, while still persisting
-        everything underneath it.
+### D6: `bench init` target directory must not pre-exist (PVC mount placement)
+**Discovered in:** Phase 1, bench-v15 PVC/pod setup (before D4 was found)
+**Finding:** Mounting the bench PVC directly at `.../frappe-bench` fails: `bench init` refuses with `ERROR: Bench instance already exists at frappe-bench`, because it needs to create that directory itself and rejects a pre-existing (even if empty) target path. Mounting the PVC one level up (e.g. at `/home/frappe/bench-data`) leaves the `frappe-bench` subdirectory path free for `bench init` to create, while everything it creates still persists on the PVC.
+**Impact on Custom Agent:** any manifest that mounts a bench's PVC directly at the bench directory path will make `bench init` fail immediately — this is the direct cause of D15's PVC path offset (`{mount}/frappe-bench/sites/...`, not `{mount}/sites/...`) and must be understood together with it.
+**Implementation rule:** always mount a new bench's PVC at the *parent* of where `bench init` will create the bench (e.g. PVC at `/home/frappe/bench-data`, bench created at `/home/frappe/bench-data/frappe-bench`), never directly at the bench directory path itself.
 
-### D7: install-app --force on an already-installed app
-Question: How to run bench install-app --force non-interactively via kubectl exec?
-Options considered:
-  - kubectl exec (no stdin) → FAILED (EOFError on Administrator password prompt)
-  - kubectl exec -i with password piped twice via stdin → ✅ CHOSEN
-Reason: --force triggers an Administrator password reset with no CLI flag to
-        skip or supply it; kubectl exec -i plus a piped answer is the only
-        non-interactive workaround. Applies to any future --force install-app
-        or similar interactive-prompt bench command run via automation.
+### D7: `install-app --force` needs stdin for the Administrator password prompt
+**Discovered in:** Phase 1, Tier A2 (install-app testing)
+**Finding:** Running `bench --site {s} install-app {app} --force` on an app already installed triggers an interactive Administrator-password reset prompt (`Set Administrator password:` / `Re-enter Administrator password:`), with no CLI flag to skip or supply it. A plain `kubectl exec` (no stdin) hits `EOFError` on the prompt and aborts.
+**Impact on Custom Agent:** any automated `--force install-app` call (or any other bench command with a similar unsuppressable interactive prompt) will hang or abort if run via a standard non-interactive `kubectl exec`.
+**Implementation rule:** use `kubectl exec -i` and pipe the Administrator password twice via stdin (once for "Set", once for "Re-enter"): `printf "{password}\n{password}\n" | kubectl exec -i {pod} -- bash -c "... install-app {app} --force"`.
 
 ## 2026-08-23 — Tier B Command Tests (test.local, frappe-v15)
 
@@ -990,26 +971,17 @@ Exit 0. Verified the site was genuinely wiped and recreated: `testuser@test.com`
 
 ## Decision Log (additions)
 
-### D8: bench reinstall admin password
-Question: How to run bench reinstall non-interactively when no admin password is given?
-Options considered:
-  - --yes only → FAILED (still prompts for Administrator password, no stdin, aborts)
-  - --admin-password flag → ✅ CHOSEN
-Reason: --yes only skips the destructive-action confirmation, not the password
-        setup step. --admin-password is a documented flag on `bench reinstall`
-        (unlike install-app --force, which has no equivalent) — cleaner than
-        piping stdin. Applies to any future automated `bench reinstall` call.
+### D8: `bench reinstall` needs `--admin-password` explicitly
+**Discovered in:** Phase 1, Tier B2 (reinstall testing)
+**Finding:** `bench --site {s} reinstall --yes --mariadb-root-username {u} --mariadb-root-password {p}` (without `--admin-password`) still hits an interactive Administrator-password prompt and aborts under a non-interactive `kubectl exec`. `--yes` only skips the destructive-action confirmation, not the password setup step.
+**Impact on Custom Agent:** an automated reinstall flow that supplies `--yes` but omits `--admin-password`, assuming `--yes` covers all prompts, will hang/abort exactly like an unsuppressed `install-app --force` (D7) — but unlike D7, there's a clean documented flag to avoid the problem entirely rather than needing a stdin workaround.
+**Implementation rule:** always pass `--admin-password {password}` explicitly on every `bench reinstall` call — never rely on `--yes` alone.
 
-### D9: build-search-index is asynchronous
-Question: Does build-search-index index synchronously or in the background?
-Finding: It enqueues a job (build_index_for_all_routes) on the "long" RQ queue
-         rather than running inline — confirmed via `bench doctor` showing
-         0 workers online and that exact job sitting unprocessed.
-Implication: In a bare bench-CLI pod (no worker processes), this command will
-             always appear to finish instantly without actually indexing
-             anything. A real deployment needs a running worker (e.g. a
-             `bench worker` Deployment) for this — and other queued jobs like
-             contact creation — to actually execute.
+### D9: `build-search-index` only enqueues a background job — it doesn't index synchronously
+**Discovered in:** Phase 1, Tier B11 (build-search-index) + B19 (`bench doctor`)
+**Finding:** `bench --site {s} build-search-index` returns instantly with exit 0 and a partial progress-bar line, but no search index is actually built. It enqueues a job (`build_index_for_all_routes`) on the RQ `long` queue rather than running inline — confirmed via `bench doctor` showing `Workers online: 0` with that exact job sitting unprocessed in the backlog.
+**Impact on Custom Agent:** in any bench pod without a running worker process, this command (and any command that similarly enqueues background work, e.g. contact creation via `add-user`) will silently appear to succeed while doing nothing — a false-positive success that's easy to miss without explicitly checking `bench doctor`'s queue backlog.
+**Implementation rule:** never treat `build-search-index`'s exit code alone as confirmation the index was built. A real deployment needs a running `bench worker` process (a separate Deployment) for this — and any other enqueued job — to actually execute; if the Agent needs to confirm completion, it must check the job queue state, not just the enqueuing command's exit code.
 
 ## 2026-08-23 — Tier C: Kubernetes-Native Operations
 
@@ -1146,23 +1118,17 @@ Cleaned up: `kubectl delete ingress test-maintenance-ingress -n frappe-v15` → 
 
 ## Decision Log (additions)
 
-### D10: Redis/MariaDB workload type in frappe-system
-Question: Are the shared infra workloads Deployments or StatefulSets?
-Finding: All of them (mariadb, redis-cache/queue/socketio master+replicas) are
-         StatefulSets — Bitnami's redis chart always uses a StatefulSet for
-         the master pod, even with persistence disabled and 0 replicas.
-Implication: Any kubectl automation targeting these by name must use
-             `statefulset <name>-master`, not `deployment <name>`, and the
-             resource name has a `-master` suffix, not the bare release name.
+### D10: Redis workloads are StatefulSets, not Deployments
+**Discovered in:** Phase 1, Tier C (pre-check before C2-C5)
+**Finding:** `frappe-system` has no Deployments at all for its Redis instances — the Bitnami Redis chart always deploys the master pod as a StatefulSet (`redis-{name}-master`), even with persistence disabled and replica count 0, for stable network identity. `kubectl rollout restart/scale/patch deployment redis-cache` fails outright: `Error from server (NotFound): deployments.apps "redis-cache" not found`.
+**Impact on Custom Agent:** any automation that assumes Redis (or MariaDB, deployed the same way in this setup) is a Deployment and targets it with `deployment/{name}`-style commands will fail with a `NotFound` error — the resource exists, just under a different kind and a different name (`-master` suffix).
+**Implementation rule:** target these workloads as `statefulset {name}-master`, never `deployment {name}` — e.g. `kubectl rollout restart statefulset redis-cache-master -n frappe-system`, not `kubectl rollout restart deployment redis-cache`.
 
-### D11: bench-v15 has no Service yet
-Finding: The bench-v15 test pod (created in the Tier A/B setup) was never
-         given a Kubernetes Service. An Ingress pointing at it is created
-         successfully but non-functional (`<error: services "bench-v15" not
-         found>`) until a Service is added.
-Implication: A real bench Deployment will need its own Service (and
-             Deployment, replacing the bare test Pod) before Ingress/Traefik
-             wiring can actually route traffic to it.
+### D11: an Ingress/IngressRoute needs a real backend Service to actually route traffic
+**Discovered in:** Phase 1, Tier C7 (create Ingress)
+**Finding:** The `bench-v15` test pod was created directly with no Kubernetes Service in front of it. An Ingress resource pointing at `bench-v15:8000` is created successfully (Kubernetes doesn't validate the backend exists at admission time) but is non-functional — `kubectl describe ingress` shows `<error: services "bench-v15" not found>`.
+**Impact on Custom Agent:** a bench without a Service can still have Ingress/IngressRoute resources created against it with no error — the Agent could believe routing is set up correctly when it silently isn't, since Kubernetes gives no feedback until real traffic is attempted.
+**Implementation rule:** every bench the Agent provisions must have a Service created (pointing at the bench's Deployment, per D16) before or alongside any Ingress/IngressRoute for it — never assume a successfully-created Ingress means traffic will actually route.
 
 ## 2026-08-23 — Tier D: Direct MariaDB Operations (D1-D5)
 
@@ -1828,21 +1794,10 @@ Image confirmed changed: `busybox:1.36` → `busybox:1.35`. Namespace deleted im
 ## 2026-08-23 — Decision Log Addition (formalizing a Phase 2 finding)
 
 ### D12: Traefik duplicate Host() behavior
-Finding: Traefik does not reject duplicate Host() matches across two
-         different IngressRoute resources — creating a second IngressRoute
-         for the same host results in two competing routers with no error.
-         Observed directly in Phase 2 Group M1: created `k8s-test-domain`
-         with the same Host(`k8s-test.local`) as the existing `bench-test`
-         IngressRoute from K5 — both were accepted, no conflict/rejection
-         at admission time.
-Impact: Custom Agent must pre-check for existing IngressRoute on the same
-        host before creating a new one, or duplicate/competing routers can
-        silently accumulate with no error signal to catch the mistake.
-Implementation rule: always use `kubectl apply` (upsert, matched by
-        resource name) rather than `kubectl create`, OR use a
-        check-then-create pattern (list existing IngressRoutes' Host()
-        matches before creating a new one) to guarantee only one router
-        exists per host.
+**Discovered in:** Phase 2, Group M1 (add domain / IngressRoute)
+**Finding:** Traefik does not reject duplicate `Host()` matches across two different IngressRoute resources — creating a second IngressRoute for the same host results in two competing routers with no error. Observed directly: created `k8s-test-domain` with the same `Host(`k8s-test.local`)` as the existing `bench-test` IngressRoute from K5 — both were accepted, no conflict/rejection at admission time.
+**Impact on Custom Agent:** the Agent must pre-check for an existing IngressRoute on the same host before creating a new one, or duplicate/competing routers can silently accumulate with no error signal to catch the mistake.
+**Implementation rule:** always use `kubectl apply` (upsert, matched by resource name) rather than `kubectl create`, OR use a check-then-create pattern (list existing IngressRoutes' `Host()` matches before creating a new one) to guarantee only one router exists per host.
 
 ## 2026-08-23 — GROUP D: Uncertain Commands
 
@@ -2383,3 +2338,25 @@ Status: (clean)
 **Finding:** `pkill -f frappe` run via `kubectl exec -n {ns} {pod} -- bash -c "pkill -f frappe"` killed its own invoking shell process (exit code 143/SIGTERM) rather than reporting "no matching process." Root cause: `pkill -f` matches against the full command line of every process, and the `bash -c` command line itself contains the substring "frappe" (via paths like `/home/frappe/bench-data/frappe-bench/...`). The pod's actual PID 1 (`sleep infinity`) was correctly unaffected, since its command line contains no such substring — but any exec'd command whose own invocation happens to match the search pattern is at risk of self-terminating.
 **Impact on Custom Agent:** if the Agent ever uses `pkill -f <pattern>` (or similar broad process-matching) inside a bench container to restart a specific process, it must guarantee the pattern cannot also match the invoking shell's own command line — otherwise the operation can silently kill the wrong thing (its own exec session) while reporting a generic-looking non-zero exit, easy to misread as "nothing to kill."
 **Implementation rule:** avoid `pkill -f` with broad substrings for any in-container process management. Prefer exact PID targeting (from `pgrep`/`ps` filtered on a narrow, unambiguous pattern verified not to match the shell invocation itself), or — better — avoid in-container process signaling entirely and rely on `kubectl rollout restart deployment/{bench}` (which restarts the whole pod cleanly via the controller, per D16/D19), rather than trying to kill individual processes inside a running container.
+
+## 2026-08-23 — Decision Log Additions (audit follow-up: 3 findings had no formal entry)
+
+Full audit of D1–D20 against a 20-item reference checklist found 3 findings that existed only as inline table/narrative mentions, never as a formal Decision Log entry under any number. Added here as D21–D23 (existing D1–D20 numbering left untouched to avoid breaking cross-references like "see D16" elsewhere in this document).
+
+### D21: Frappe site database name is an auto-generated hash, not the site domain
+**Discovered in:** Phase 1, Tier D3 (database size query)
+**Finding:** The MariaDB database backing a Frappe site is **not** named after the site's domain (e.g. `test.local` does not have a database literally called `test_local`). Frappe auto-generates a hash-style database name at `bench new-site` time (confirmed: `_9354d31722f40d9e` for `test.local`). Any command assuming `USE {site_with_dots_replaced}` or `WHERE table_schema='{site_name}'` will fail or silently return nothing — confirmed directly: `USE test_local; SHOW TABLES;` → `ERROR 1049: Unknown database 'test_local'`.
+**Impact on Custom Agent:** any SQL-level operation the Agent performs directly against a site's database (table listing, size queries, optimize/repair, direct backups) must resolve the real database name first — it cannot be derived from the site name by simple string transformation.
+**Implementation rule:** always read the real database name from the site's own `site_config.json` (`db_name` field) rather than deriving it from the site domain string. Never assume `{site-name-with-underscores}` is the database name.
+
+### D22: `bench git apply` is not a real bench subcommand
+**Discovered in:** Phase 1, Group A (git apply / git apply --reverse testing)
+**Finding:** `bench git apply {patch}` fails with `Error: No such command 'git'.` — there is no `git` subcommand namespace under the `bench` CLI. This is likely a description artifact from the source material being audited, not a real Agent capability. The actual, working mechanism is plain `git apply`/`git apply --reverse`, run directly inside the app's directory (confirmed working: apply → change present → reverse → working tree clean).
+**Impact on Custom Agent:** if the Agent's patch-application logic is built assuming a `bench git apply` command exists, every patch-apply operation will fail immediately with a confusing "no such command" error.
+**Implementation rule:** apply/reverse patches via plain `git apply {patch}` / `git apply --reverse {patch}`, executed with a working directory of the target app's repo (`apps/{app}`) — never through a `bench git ...` subcommand, which doesn't exist.
+
+### D23: `update-site-plan` is a Frappe Cloud (`press`)-specific command, not core Frappe
+**Discovered in:** Phase 1, Group A (update-site-plan testing)
+**Finding:** `bench --site {s} update-site-plan {plan}` fails with `Error: No such command 'update-site-plan'.` on a bench that only has the `frappe` app installed. This command is not part of the core Frappe framework's bench CLI — it's almost certainly provided by the `press` app (Frappe Cloud's own management app), which isn't installed in this environment.
+**Impact on Custom Agent:** if the Agent's site-plan/billing-tier logic assumes `update-site-plan` is always available as a bench command, it will fail on any bench that doesn't have the `press` app installed — which is the normal case for a bench that only runs customer apps.
+**Implementation rule:** do not depend on `update-site-plan` (or other `press`-app-specific bench commands) being available. If site-plan tracking is needed, the Agent should manage that state itself (e.g. in its own database/site_config) rather than relying on a command that only exists when a specific optional app is installed.
