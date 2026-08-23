@@ -1626,3 +1626,61 @@ frappe 15.118.0 version-15
 | K9 Verify | ✅ Pass |
 
 **9/9 clean — zero modifications needed this time.** Every issue hit during the original bare-Pod bench setup (Tier A: PVC mount path, missing `--skip-redis-config-generation`, missing `redis://` scheme) was designed around correctly from the start here, since a proper Deployment+Service+IngressRoute is what a real bench actually needs in production.
+
+## 2026-08-23 — Phase 2, GROUP L: Bench Restart and Scaling
+
+Replaces `supervisorctl restart`/`docker stop`/`docker start`/`docker update` for `bench-test` (frappe-test namespace).
+
+### L1: Rolling restart — ✅ Pass
+```
+$ kubectl rollout restart deployment/bench-test -n frappe-test
+deployment.apps/bench-test restarted
+$ kubectl rollout status deployment/bench-test -n frappe-test
+deployment "bench-test" successfully rolled out
+```
+New pod name confirmed: `bench-test-696bf5f95f-zhtp6` replacing `bench-test-69f6bdfc87-fpvf4`.
+
+### L2: Scale down — ✅ Pass
+```
+$ kubectl scale deployment/bench-test --replicas=0 -n frappe-test
+deployment.apps/bench-test scaled
+```
+Pods briefly showed `Terminating` past a quick check (grace-period timing, not a stuck state — confirmed gone moments later): `kubectl get pods -n frappe-test` → `No resources found`.
+
+### L3: Scale up — ✅ Pass
+```
+$ kubectl scale deployment/bench-test --replicas=1 -n frappe-test
+$ kubectl rollout status deployment/bench-test -n frappe-test --timeout=60s
+deployment "bench-test" successfully rolled out
+```
+New pod `bench-test-696bf5f95f-6ftc6` running. Bench data verified intact via PVC:
+```
+$ bench --site k8s-test.local list-apps
+frappe 15.118.0 version-15
+```
+
+### L4: Patch resource limits — ✅ Pass
+```
+$ kubectl patch deployment bench-test -n frappe-test --patch '{"spec":{"template":{"spec":{"containers":[{"name":"bench","resources":{"requests":{"memory":"512Mi","cpu":"250m"},"limits":{"memory":"1Gi","cpu":"500m"}}}]}}}}'
+deployment.apps/bench-test patched
+$ kubectl rollout status deployment/bench-test -n frappe-test --timeout=60s
+deployment "bench-test" successfully rolled out
+$ kubectl describe pod -n frappe-test -l app=bench-test | grep -A4 Limits
+Limits:
+  cpu:     500m
+  memory:  1Gi
+Requests:
+  cpu:        250m
+  memory:     512Mi
+```
+
+### GROUP L Summary
+
+| Step | Result |
+|---|---|
+| L1 Rolling restart | ✅ Pass |
+| L2 Scale down | ✅ Pass |
+| L3 Scale up (+ data persistence) | ✅ Pass |
+| L4 Patch resources | ✅ Pass |
+
+**4/4 clean.** All standard Deployment-native operations — no custom Agent logic needed beyond issuing the right `kubectl` command against the right resource.
