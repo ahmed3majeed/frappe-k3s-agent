@@ -142,13 +142,13 @@ All commands tested identically to Phase 1 Tier A, against `v16-test.local` (ben
 - **Node.js:** v24.13.0 (image default works fine for v14 — only Python needed downgrading)
 - **MariaDB:** 10.11 (shared `frappe-system` instance)
 - **Redis:** 8 (dedicated `redis-v14`, 3-container pattern per D24)
-- **Frappe version:** 14.101.1 — note `list-apps` doesn't display this (D34); confirmed via `sites/apps.json` instead
+- **Frappe version:** 14.101.1 — `list-apps` showed no version/branch immediately after `new-site`, but did show it correctly after the first `migrate` ran (D34, corrected — this is a site-lifecycle state, not a fixed v14 limitation)
 - **bench new-site flags:** `--mariadb-user-host-login-scope` **does not exist** in v14 — must use `--no-mariadb-socket` (D33)
 - **Notes:**
   - `bench init` needs the D32 workaround (Python 3.11 + dev headers) — otherwise fails outright
   - `new-site` shows two new steps not in v15/v16: `Restoring Database file...`, `Updating country info`
   - Still shows the MariaDB version deprecation warning (like v15, unlike v16)
-  - `list-apps` shows bare app name only, no version/branch (D34)
+  - `list-apps` showed bare app name only *before the first migrate* — resolved after migrate ran (D34, corrected)
   - `backup` uses `mysqldump` (not `mariadb-dump`) with an older shell-wrapping pattern, but still relative paths like v15 (D35)
   - `setup requirements` includes an `npm`/`snyk-protect` step not seen in v15/v16's plain `yarn`
 
@@ -174,8 +174,8 @@ All commands tested identically to Phase 1 Tier A, against `v16-test.local` (ben
 | backup --with-files --verbose | — | ⚡ (`mysqldump`, older shell pattern, relative paths, D35) | ✅ | ⚡ (absolute paths, D28) | Binary name AND path format both vary by version |
 | clear-cache | — | ✅ | ✅ | ✅ | |
 | clear-website-cache | — | ✅ | ✅ | ✅ | |
-| list-apps | — | ⚡ (no version/branch shown, D34) | ✅ | ✅ | |
-| list-apps -f json | — | ⚡ (same, no version field) | ✅ | ✅ | |
+| list-apps | — | ✅ (shows full info after first migrate, D34 corrected) | ✅ | ✅ | Pre-migrate state shows bare name on any version, not v14-specific |
+| list-apps -f json | — | ✅ (same correction) | ✅ | ✅ | |
 | set-maintenance-mode on/off | — | ✅ | ✅ | ✅ | |
 | scheduler pause/resume/enable | — | ✅ | ✅ | ✅ | |
 | set-admin-password | — | ✅ | ✅ | ✅ | |
