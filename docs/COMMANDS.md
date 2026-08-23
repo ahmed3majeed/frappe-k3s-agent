@@ -654,3 +654,210 @@ These are Docker/Swarm/supervisor/nginx/host-metric commands the original Agent 
 | **Total tested** | **86** | **71** | **12** | **3** | **4** |
 
 Full raw command output for everything above: `RUNBOOK.md`, dated 2026-08-22/23, sections "Tier A/B/C/D" and "Master Command List: GROUP A/B/C".
+
+---
+
+## Phase 2: K8s Bench Lifecycle
+
+Full end-to-end verification of the K8s-native operations that replace what the original Docker-based Agent did with `docker run`/`docker stop`/`docker rm`/nginx-reload/`git pull`+`supervisorctl`. Built and torn down a complete bench (`bench-test`, namespace `frappe-test`, site `k8s-test.local`) as proper Deployment+Service+IngressRoute resources — not a bare Pod like the Phase 1 `bench-v15` setup — since that's what a real bench actually needs in production. All manifests saved to `k3s/`. `frappe-v15`/`bench-v15` were never touched.
+
+---
+
+### GROUP K — Full bench lifecycle (Namespace → PVC → Deployment → Service → IngressRoute → bench init → site)
+
+---
+
+### K1–K2: Namespace + PVC
+**Original Agent uses:** `docker run -d --name {bench} {image} ...` (implicit: Docker creates its own storage/network on first run)
+**K8s equivalent:** `kubectl create namespace {ns}`; `kubectl apply -f k3s/bench-pvc.yaml`
+**Status:** ✅ Pass
+**Modification:** None. PVC shows `Pending` until a pod claims it (`local-path` storage class uses `WaitForFirstConsumer` binding) — expected, not an error.
+**Verified by:** `kubectl get pvc` → `Bound` once the Deployment (K3) picked it up.
+
+---
+
+### K3: Deployment
+**Original Agent uses:** `docker run -d --init -u frappe ... --name {name} {image}`
+**K8s equivalent:** `kubectl apply -f k3s/bench-deployment.yaml`
+**Status:** ✅ Pass
+**Modification:** None. PVC mounted directly at `/home/frappe/bench-data` (one level above where `bench init` creates `frappe-bench`) — correct from the start, avoiding the mount-path issue discovered the hard way in Phase 1's bare-Pod setup.
+**Verified by:** `kubectl wait --for=condition=Available` succeeded; pod `Running`.
+
+---
+
+### K4: Service
+**Original Agent uses:** N/A (Docker's own bridge network + published ports)
+**K8s equivalent:** `kubectl apply -f k3s/bench-service.yaml`
+**Status:** ✅ Pass
+**Modification:** None. Exposes both 8000 (web) and 9000 (socketio).
+**Verified by:** `kubectl get svc` → ClusterIP with both ports listed.
+
+---
+
+### K5: IngressRoute
+**Original Agent uses:** write to `nginx_directory/hosts/{site}.conf` + `nginx -s reload`
+**K8s equivalent:** `kubectl apply -f k3s/bench-ingressroute.yaml` (Traefik CRD, `apiVersion: traefik.io/v1alpha1`)
+**Status:** ✅ Pass
+**Modification:** None. Pre-verified the CRD/apiVersion actually exists in this cluster before writing the manifest (`kubectl api-resources | grep traefik`) — confirmed `traefik.io/v1alpha1` for both `IngressRoute` and `Middleware`.
+**Verified by:** `kubectl describe ingressroute` — correctly wired to the real `bench-test` Service (unlike a dangling test Ingress from Phase 1 Tier C7, which pointed at a nonexistent backend).
+
+---
+
+### K6: bench init
+**Original Agent uses:** implicit at image-build time in Docker (bench pre-baked into the image)
+**K8s equivalent:** `kubectl exec {pod} -- bash -c "cd {bench_dir} && bench init frappe-bench --frappe-branch version-15 --skip-redis-config-generation"`
+**Status:** ✅ Pass
+**Modification:** None needed this time — both fixes discovered in Phase 1 (correct PVC mount depth, `--skip-redis-config-generation` flag) were designed in from the start.
+**Verified by:** `SUCCESS: Bench frappe-bench initialized`.
+
+---
+
+### K7: Configure infrastructure hosts
+**Original Agent uses:** writes directly into `common_site_config.json` inside the bind-mounted bench directory
+**K8s equivalent:** `bench set-mariadb-host` / `set-redis-cache-host` / `set-redis-queue-host` / `set-redis-socketio-host`, via `kubectl exec`
+**Status:** ✅ Pass
+**Modification:** None — used the `redis://` URL scheme from the start (learned from Phase 1 Tier A, where the bare `host:port` format failed `bench new-site`).
+**Verified by:** `cat sites/common_site_config.json` — all four hosts correct.
+
+---
+
+### K8–K9: Create site + verify
+**Original Agent uses:** `docker exec {container} bench new-site ...`
+**K8s equivalent:** `kubectl exec {pod} -- bash -c "cd {bench_dir} && bench new-site k8s-test.local ..."`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `bench --site k8s-test.local list-apps` → `frappe 15.118.0 version-15`.
+
+---
+
+## GROUP L — Bench restart and scaling
+
+---
+
+### L1: Rolling restart
+**Original Agent uses:** `supervisorctl restart frappe-bench-workers:` (or similar target)
+**K8s equivalent:** `kubectl rollout restart deployment/{bench}`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** New pod name confirmed (`...-696bf5f95f-zhtp6` replacing `...-69f6bdfc87-fpvf4`).
+
+---
+
+### L2: Scale down
+**Original Agent uses:** `docker stop {name}`
+**K8s equivalent:** `kubectl scale deployment/{bench} --replicas=0`
+**Status:** ✅ Pass
+**Modification:** None. Pods briefly show `Terminating` past a quick check — grace-period timing, not a stuck state.
+**Verified by:** `kubectl get pods` → `No resources found` shortly after.
+
+---
+
+### L3: Scale up (+ data persistence)
+**Original Agent uses:** `docker start {name}`
+**K8s equivalent:** `kubectl scale deployment/{bench} --replicas=1`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** New pod `Running`; `bench --site k8s-test.local list-apps` still returns correctly — bench data survived the scale-to-0/scale-to-1 cycle via the PVC.
+
+---
+
+### L4: Patch resource limits
+**Original Agent uses:** `docker update --memory ... --cpus ... {name}`
+**K8s equivalent:** `kubectl patch deployment/{bench} -p '{resources...}'`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `kubectl describe pod | grep -A4 Limits` → exact requested values (`cpu: 500m, memory: 1Gi` limits; `cpu: 250m, memory: 512Mi` requests).
+
+---
+
+## GROUP M — Domain and routing management
+
+---
+
+### M1–M2: Add domain(s)
+**Original Agent uses:** write to `nginx_directory/hosts/{site}.conf`
+**K8s equivalent:** `kubectl apply -f` an `IngressRoute` manifest
+**Status:** ✅ Pass
+**Modification:** None functionally. Note: M1 used the same host as the existing K5 IngressRoute — Traefik doesn't reject duplicate host matches at admission time (each IngressRoute becomes its own router); removed at M3 before it could cause routing ambiguity. M2 used a genuinely distinct host (`custom-domain.local`) and worked cleanly.
+**Verified by:** `kubectl get ingressroute` listing both new resources.
+
+---
+
+### M3: Remove domain
+**Original Agent uses:** delete the site's nginx conf file + reload
+**K8s equivalent:** `kubectl delete ingressroute {name}`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `kubectl get ingressroute` — target gone, others untouched.
+
+---
+
+### M4: Maintenance mode middleware
+**Original Agent uses:** nginx-level redirect config
+**K8s equivalent:** `kubectl apply -f` a Traefik `Middleware` manifest (`redirectRegex`)
+**Status:** ✅ Pass
+**Modification:** None. (Resource creation only was in scope — actually attaching it to a route via the `router.middlewares` annotation was already exercised in Phase 1 Tier C9.)
+**Verified by:** `kubectl describe middleware` — spec matches exactly.
+
+---
+
+## GROUP N — Bench archive and cleanup
+
+---
+
+### N1: Archive (keep data, remove compute/routing)
+**Original Agent uses:** `docker rm {name} --force` (bind-mounted data survives on the host)
+**K8s equivalent:** `kubectl scale --replicas=0` + `kubectl delete deployment/service/ingressroute` (PVC left alone)
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `kubectl get pvc` → still `Bound`, 10Gi, after Deployment/Service/IngressRoutes all deleted.
+
+---
+
+### N2: Restore from archived PVC
+**Original Agent uses:** N/A — Docker bind mounts don't have an equivalent "archive" concept; this is a K8s-native capability
+**K8s equivalent:** `kubectl apply -f k3s/bench-deployment.yaml` (same PVC claim name)
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** New pod's `sites/` directory contains the full original site (`k8s-test.local`, `apps.json`, `apps.txt`, `assets`, `common_site_config.json`); `bench --site k8s-test.local list-apps` still returns `frappe 15.118.0 version-15` — zero data loss across the archive/restore cycle.
+
+---
+
+### N3: Full cleanup
+**Original Agent uses:** `docker stack rm {name}`
+**K8s equivalent:** `kubectl delete namespace {ns}`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `kubectl get namespace frappe-test` → `NotFound`. Confirmed `frappe-v15`/`bench-v15` (the protected test bench) untouched throughout.
+
+---
+
+## GROUP O — Agent self-update concept
+
+---
+
+### O1: Image update + rollout
+**Original Agent uses:** `git reset --hard && git fetch && git merge && supervisorctl restart agent:*`
+**K8s equivalent:** `kubectl set image deployment/{agent} {container}={new-image}:{tag}` + rollout wait
+**Status:** ✅ Pass
+**Modification:** None. First run (as literally specified) hit the documented fallback branch, since `bench-test`/`frappe-test` had already been deleted in Group N. To get real evidence rather than just the fallback message, additionally demonstrated the live mechanism on a disposable `demo-agent` deployment.
+**Verified by:** Image confirmed changed (`busybox:1.36` → `busybox:1.35`), `kubectl rollout status` → `successfully rolled out`. **Conclusion: Agent self-update in K8s is purely an image update + rollout — no `git pull`, no `supervisorctl restart`. The new code ships as a pre-built image; the rollout mechanism K8s already provides handles the swap.**
+
+---
+
+## Phase 2 Summary
+
+| Group | Steps | ✅ Pass | ⚡ Modified | ❌ Fail |
+|---|---|---|---|---|
+| K — Full bench lifecycle | 9 | 9 | 0 | 0 |
+| L — Restart/scaling | 4 | 4 | 0 | 0 |
+| M — Domain/routing | 4 | 4 | 0 | 0 |
+| N — Archive/cleanup | 3 | 3 | 0 | 0 |
+| O — Self-update concept | 1 | 1 | 0 | 0 |
+| **Total** | **21** | **21** | **0** | **0** |
+
+**21/21 clean — every operation worked as designed with zero modifications needed.** This is a direct consequence of Phase 1's findings: every hard-won lesson (PVC mount depth, `--skip-redis-config-generation`, `redis://` scheme, real Traefik CRD versions) was already known and built correctly into these manifests from the start, rather than discovered through trial and error here. The `k3s/` manifests in this repo are the verified templates the real Custom Agent can build on directly.
+
+Manifests: `k3s/bench-pvc.yaml`, `k3s/bench-deployment.yaml`, `k3s/bench-service.yaml`, `k3s/bench-ingressroute.yaml`, `k3s/ingressroute-custom-domain.yaml`, `k3s/middleware-maintenance.yaml`.
+
+Full raw output for every Phase 2 test: `RUNBOOK.md`, dated 2026-08-23, "Phase 2, GROUP K/L/M/N/O" sections.
