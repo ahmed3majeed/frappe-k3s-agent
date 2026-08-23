@@ -2811,3 +2811,66 @@ Just the bare app name — **no version number, no branch**, unlike v15/v16's `f
 **Finding:** v15/v16's backup command invokes `mariadb-dump` (confirmed throughout Phase 1-3) with `set -o pipefail; mariadb-dump ... | gzip`. v14's backup invokes the older `mysqldump` binary name, wrapped in a different shell pattern: `self=$$; ( mysqldump ... || kill $self ) | gzip`. Both binaries exist and work in this environment (MariaDB ships both `mysqldump` and `mariadb-dump` as compatible aliases), so functionally the backup succeeds either way — but the exact command text differs.
 **Impact on Custom Agent:** if the Agent parses `bench backup --verbose`'s printed dump command (e.g. to extract connection parameters, or to detect what tool is being used for a security/audit check), it must handle both binary names and both shell-wrapping patterns.
 **Implementation rule:** don't string-match on `mariadb-dump` specifically when inspecting backup command output — treat `mysqldump` and `mariadb-dump` as equivalent, and don't assume a fixed shell-wrapping pattern (`set -o pipefail; ...` vs `self=$$; (... || kill $self)`) across Frappe versions.
+
+## 2026-08-23 — Frappe v13 Environment Setup — ❌ Incompatible with current image
+
+### T1: Resource check — plenty available
+125G disk free (15% used) after v14's setup, 21Gi RAM available. No concerns.
+
+### T2-T5: Namespace, secrets, Redis, PVC, Deployment — ✅ All pass
+Identical pattern to v14/v16: `frappe-v13` namespace, `dockerhub-secret` copied, `redis-v13` (3-container pattern, all ports verified), `bench-v13-data` PVC bound, `bench-v13` Deployment running.
+
+### T6: Python/Node versions — same image
+`Python 3.14.2`, `v24.13.0` — same as all other versions (same unpinned `frappe/bench:latest` image).
+
+### T7: bench init — ❌ FAILED — v13 incompatible with this image (two independent failure modes)
+
+Applied the D32 lesson proactively this time (installed `python3.11-dev` and used `--python /usr/bin/python3.11` from the first attempt, rather than rediscovering the Python issue):
+```
+$ bench init frappe-bench --frappe-branch version-13 --skip-redis-config-generation --python /usr/bin/python3.11
+```
+Python-side dependency installation succeeded this time (v13's Python-level pins are apparently satisfied by 3.11, same as v14). **But it failed at a different, later stage — `yarn install` for the `frappe` app itself:**
+```
+bench.exceptions.CommandFailedError: yarn install --check-files
+ERROR: There was a problem while creating frappe-bench
+```
+
+Investigated directly (ran `yarn install --check-files` manually in the partially-created app directory to get the real error, since bench's own traceback didn't show it):
+```
+../src/binding.cpp: In function ...
+gyp ERR! build error
+gyp ERR! stack Error: `make` failed with exit code: 2
+gyp ERR! node -v v24.13.0
+gyp ERR! node-gyp -v v8.4.1
+Build failed with error code: 1
+```
+**Root cause:** v13 depends on `node-sass`, which compiles a native C++ addon (`node_modules/node-sass/build`) against Node's native addon ABI (via the NAN/`NODE_MODULE` macros). This compilation genuinely progressed for several minutes (confirmed via `ps aux` showing `cc1plus` moving through different `libsass` source files — not a hang) before failing: `node-sass`'s bindings are incompatible with Node v24's V8/addon ABI. This is a well-known, industry-wide issue — `node-sass` was deprecated years ago for exactly this reason (inability to keep up with newer Node ABI versions), which is why Frappe itself moved to Dart Sass (no native compilation) starting with later versions. v13's official requirement is Node 14 — six major versions behind this image's Node 24.
+
+**Unlike D32's Python issue, this is not fixable via a CLI flag or a missing header package** — it would require an entirely different (EOL) Node.js major version, installed via `nvm install 14` or similar, with no guarantee that *other* tooling in this same image (bench, yarn itself, other native modules) would still work correctly against such an old Node runtime. Per the task's own explicit rule ("v13 is EOL — incompatibility with modern Python/Node is expected... do NOT spend more than 20 minutes debugging"), stopped here.
+
+**Cleanup:** removed the partial `frappe-bench` directory. Disk confirmed healthy afterward (125G → 21G used, no leak from the failed native builds). See **D36**.
+
+### T8-T10: Configure hosts, create site, verify — SKIPPED
+Setup did not succeed; per the task's own instructions, these steps and Tier A testing are skipped entirely for v13.
+
+**v13 is not compatible with `frappe/bench:latest` (Python 3.14.2 / Node v24.13.0) as currently configured. Would require a dedicated older-Node image (Node 14-something) to test further — out of scope for this pass.**
+
+### PHASE 2 (v13) Summary
+
+| Step | Result |
+|---|---|
+| T1 Resource check | ✅ Pass |
+| T2-T5 Namespace/secrets/Redis/PVC/Deployment | ✅ Pass |
+| T6 Python/Node check | ✅ Pass (recorded, same image) |
+| T7 bench init | ❌ Fail — Node ABI incompatibility (node-sass), not fixable within budget |
+| T8-T10 + Tier A | Skipped (setup didn't succeed) |
+
+`frappe-v15`/`frappe-v16` never touched throughout this entire v13/v14 phase.
+
+## Decision Log Addition
+
+### D36: Frappe v13 is incompatible with `frappe/bench:latest`'s Node version — `node-sass` native compilation fails
+**Discovered in:** Frappe v13 environment setup, T7 (bench init)
+**Finding:** Even after applying D32's Python 3.11 fix (which resolves v13's Python-side dependency issues too), `bench init --frappe-branch version-13` fails at the `yarn install` step for the `frappe` app itself: `node-sass`'s native C++ addon (compiled via `node-gyp`/`make` against Node's NAN/`NODE_MODULE` ABI) fails to build against Node v24.13.0. Confirmed this is a genuine multi-minute compilation attempt (not a quick/config error) that ultimately fails with `gyp ERR! build error` / `make: *** Error 1`. v13 officially requires Node 14; `node-sass` (deprecated industry-wide for exactly this ABI-fragility reason) cannot bridge a 6-major-version gap.
+**Impact on Custom Agent:** unlike D32's Python fix (a CLI flag + a header package), this failure **cannot** be resolved with a simple per-version flag — it requires an entirely different Node.js major version at the OS/image level. Any Agent designed to provision arbitrary Frappe versions from one shared, current-Node base image will hit a hard wall for v13 (and likely anything else still depending on `node-sass` rather than Dart Sass).
+**Implementation rule:** do not attempt to support Frappe v13 (or any other EOL version still on `node-sass`) from the same base image used for v14+. Either maintain a dedicated older-Node base image specifically for such legacy versions (with Node 14 via `nvm`, accepting that other modern tooling in that image may need matching downgrades), or explicitly declare these versions unsupported by the Custom Agent and document the cutoff clearly (this project's testing confirms the practical floor is **v14**, with the D32 Python workaround — v13 and earlier are out of reach without a fundamentally different image).
