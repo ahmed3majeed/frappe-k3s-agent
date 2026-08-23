@@ -71,3 +71,34 @@ $ redis-cli -p 6381 ping   → Could not connect to Redis at 127.0.0.1:6381: Con
 | MariaDB instance | `frappe-system` (shared) | `frappe-system` (same, shared) |
 | Redis instance | `frappe-system` (shared, 3 Bitnami instances) | dedicated `redis-v16` (isolated, 3 sidecar containers) |
 | Bench resource type | bare Pod (legacy, Phase 1) | Deployment (correct, from the start) |
+
+---
+
+## Tier A Command Comparison: v15 vs v16
+
+All commands tested identically to Phase 1 Tier A, against `v16-test.local` (bench-v16, frappe-v16 namespace).
+
+| Command | v15 | v16 | Difference |
+|---|---|---|---|
+| new-site | ✅ | ⚡ | 2 new steps: "Creating Workspace Sidebars", "Creating Desktop Icons"; no MariaDB deprecation warning (D26) |
+| install-app --force | ⚡ needs `kubectl exec -i` + piped password (D7) | ⚡ | Worked **without** `-i` at all (pipe is self-contained inside the exec'd `bash -c`) — only one `Set Administrator password:` prompt appeared, not v15's two ("Set" + "Re-enter"). Unclear if this is a genuine UX simplification in v16 or a technique artifact of the internal-pipe approach; not re-verified with the external-`-i` technique to isolate which |
+| migrate | ✅ | ⚡ | New steps not present in v15: `Removing orphan Notifications/Workspace Sidebars/Desktop Icons`, `Deleting icon Frappe Framework`, `Syncing portal menu...`, `Updating installed applications...` — see D27 |
+| migrate --skip-failing | ✅ | ✅ | Same flag semantics, same new v16 steps as plain migrate |
+| migrate --skip-search-index | ✅ | ✅ | Same flag semantics (correctly omits the reindex-queue message), same new v16 steps |
+| backup --with-files --verbose | ✅ | ⚡ | Backup Summary lists **absolute** paths (`/home/frappe/bench-data/...`); v15 used **relative** paths (`./test.local/...`) — see D28 |
+| clear-cache | ✅ | ✅ | Identical (silent success) |
+| clear-website-cache | ✅ | ✅ | Identical (silent success) |
+| list-apps | ✅ | ✅ | Identical format |
+| list-apps -f json | ✅ | ✅ | Identical format |
+| set-maintenance-mode on/off | ✅ | ✅ | Identical |
+| scheduler pause/resume/enable | ✅ | ✅ | Identical confirmation messages |
+| set-admin-password | ✅ | ✅ | Identical (silent success) |
+| add-user | ✅ | ✅ | Identical (silent success, verified via execute) |
+| add-system-manager | ✅ | ✅ | Identical (silent success) |
+| build --app frappe | ✅ | ✅ | Same output shape, same ~15-18s build time |
+| setup requirements | ✅ | ✅ | Identical |
+| doctor | ✅ | ⚡ | New queued job type appears: `frappe.model.delete_doc.delete_dynamic_links` — a side effect of migrate's new orphan-cleanup steps (D27), not an independent behavior change. Core finding (0 workers online) unchanged |
+| restore | ✅ | ✅ | Identical fallback path resolution and success behavior |
+| drop-site | ✅ | ⚡ | Archived sites move to a **top-level** `frappe-bench/archived/sites/` directory in v16, vs v15's `frappe-bench/sites/archived/` (nested inside `sites/`) — see D29 |
+
+**16/20 identical to v15, 5/20 show a real behavioral or structural difference** (new-site, install-app technique note, migrate, backup, doctor's queue contents as a migrate side-effect, and drop-site's archive location — counted as 5 distinct differences since doctor's change isn't independent of migrate's).

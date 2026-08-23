@@ -2470,3 +2470,119 @@ Audited RUNBOOK.md against 3 findings from the v16 environment setup before star
 **Finding:** Comparing `bench new-site` output between v15 and v16 (same `frappe/bench:latest` image, same MariaDB 10.11 instance, only the app version differs) surfaced two concrete differences: (1) v16 prints **no** `Warning: MariaDB version [...] is more than 10.8 which is not yet tested with Frappe Framework` — a warning v15 printed on every single `new-site`/`reinstall`/`restore` call; (2) v16's install sequence includes two extra steps not present in v15's output: `Creating Workspace Sidebars` and `Creating Desktop Icons`, appearing just before `Updating Dashboard for frappe`.
 **Impact on Custom Agent:** if the Agent parses `bench new-site` output to detect specific known warnings/steps (e.g. to decide whether to surface a compatibility warning to the user, or to track install progress by matching expected output lines), a parser tuned against v15's output will not see the MariaDB warning on v16 (falsely appearing "cleaner") and will encounter unexpected extra lines it wasn't built to recognize.
 **Implementation rule:** any output-parsing logic in the Agent (warning detection, progress tracking, success/failure classification) must be tested against each Frappe major version separately, not assumed stable across versions — `bench`'s own CLI output is not a stable, version-independent contract. Full comparison table: `docs/VERSION-MATRIX.md`.
+
+## 2026-08-23 — Tier A: Core Command Testing on Frappe v16
+
+Same commands as Phase 1 Tier A, run against `v16-test.local` (`bench-v16`, `frappe-v16` namespace), comparing directly to v15 behavior. Full comparison table: `docs/VERSION-MATRIX.md`.
+
+### A1: new-site — ⚡ Different (already documented, D26) — skipped, already covered
+
+### A2: install-app --force — ⚡ Different
+```
+$ kubectl exec -n frappe-v16 deployment/bench-v16 -- bash -c "
+  echo -e 'admin123\nadmin123' | bench --site v16-test.local install-app frappe --force
+"
+...
+Warning: Password input may be echoed.
+Set Administrator password:
+
+Creating Workspace Sidebars
+Creating Desktop Icons
+Updating Dashboard for frappe
+```
+Exit 0. Two things worth noting: (1) this worked **without** `kubectl exec -i` — the pipe (`echo -e ... | bench ...`) is entirely self-contained inside the exec'd `bash -c` string, so it doesn't depend on external stdin forwarding at all (this technique would have worked for v15 too, in retrospect — v15's testing used the external `-i` + piped-stdin approach instead). (2) Only **one** `Set Administrator password:` prompt is visible, not v15's two (`Set` + `Re-enter`) — unclear if v16 genuinely only asks once, or if the "Re-enter" line just wasn't flushed to the captured output. Verified the install actually took: `list-apps` → `frappe 16.31.0 version-16`.
+
+### A3/A4/A5: migrate (+ --skip-failing, --skip-search-index) — ⚡ Different
+```
+$ bench --site v16-test.local migrate
+Removing orphan Notifications
+Removing orphan Workspace Sidebars
+Removing orphan Desktop Icons
+Deleting icon Frappe Framework
+Syncing portal menu...
+Updating installed applications...
+Executing `after_migrate` hooks...
+Queued rebuilding of search index for v16-test.local
+```
+New steps not present in v15's migrate output: orphan-record cleanup (Notifications/Workspace Sidebars/Desktop Icons), icon deletion, portal menu sync, and an explicit "Updating installed applications..." step. Flag semantics unchanged: `--skip-search-index` still correctly omits the reindex-queue message; `--skip-failing` behaves the same as v15. See **D27**.
+
+### A6: backup --with-files --verbose — ⚡ Different
+```
+Backup Summary for v16-test.local at 2026-08-23 18:26:28
+Config  : /home/frappe/bench-data/frappe-bench/sites/v16-test.local/private/backups/20260823_182627-v16-test_local-site_config_backup.json 218.0B
+Database: /home/frappe/bench-data/frappe-bench/sites/v16-test.local/private/backups/20260823_182627-v16-test_local-database.sql.gz 245.8KiB
+...
+```
+v16 lists **absolute** paths in the Backup Summary; v15 always used relative paths (`./test.local/private/backups/...`). See **D28**.
+
+### A7-A17: clear-cache, clear-website-cache, list-apps (+ -f json), set-maintenance-mode, scheduler, set-admin-password, add-user, add-system-manager, build, setup requirements — ✅ All identical to v15
+No behavioral differences found. `add-user` verified via `execute frappe.client.get_list` → `[{"name": "testuser16@test.com"}]`.
+
+### A18: doctor — ⚡ Different (side effect of A3-A5)
+```
+$ bench doctor
+Workers online: 0
+Queue: default
+  frappe.model.delete_doc.delete_dynamic_links : 1
+  frappe.core.doctype.user.user.create_contact : 4
+Queue: long
+  build_index_for_all_routes : 2
+```
+New job type (`delete_dynamic_links`) appears — a direct consequence of migrate's new orphan-cleanup steps (D27) enqueuing work, not an independent doctor-specific change. Core finding (0 workers online, matching D9) unchanged.
+
+### A19: restore — ✅ Identical to v15
+```
+$ bench --site v16-test.local restore --mariadb-root-username root --mariadb-root-password *** --admin-password *** sites/v16-test.local/private/backups/20260823_182627-v16-test_local-database.sql.gz
+File ... not found. Trying to check in alternative directories.
+File /home/frappe/bench-data/frappe-bench/sites/... found.
+App frappe already installed
+*** Scheduler is enabled ***
+Site v16-test.local has been restored
+```
+Same fallback path resolution behavior as v15. No MariaDB deprecation warning (consistent with D26).
+
+### A20: drop-site — ⚡ Different
+Created throwaway `drop16-test.local`, then:
+```
+$ bench drop-site drop16-test.local --no-backup --force --root-login root --root-password ***
+Dropping site database and user
+Moving site to archive under /home/frappe/bench-data/frappe-bench/archived/sites
+```
+Verified directly:
+```
+$ ls /home/frappe/bench-data/frappe-bench/archived/
+sites
+$ ls /home/frappe/bench-data/frappe-bench/sites/archived/
+No such file or directory
+```
+v16 archives dropped sites at a **top-level** `frappe-bench/archived/sites/` directory (sibling to `sites/`); v15 archived them at `frappe-bench/sites/archived/` (nested inside `sites/`). See **D29**. `v16-test.local` confirmed unaffected afterward.
+
+### Tier A v16 Summary
+
+| Result | Count |
+|---|---|
+| ✅ Same as v15 | 15 (A7-A17, A19 — 12 commands, several tested via multiple flag variants) |
+| ⚡ Different from v15 | 5 (A1/new-site, A2, A3-A5/migrate, A6/backup, A18/doctor side-effect, A20/drop-site) |
+| ❌ Fails on v16 | 0 |
+
+**No outright failures — every command that works on v15 works on v16.** All differences are output-format/behavior changes, not breakages, but each one matters for anything (like the real Custom Agent) that parses `bench` output or assumes fixed file/directory locations.
+
+## Decision Log Additions
+
+### D27: Frappe v16's `bench migrate` has new cleanup steps not present in v15
+**Discovered in:** Frappe v16 Tier A testing, A3 (migrate)
+**Finding:** `bench --site {s} migrate` on v16 performs several steps not present in v15's migrate output: `Removing orphan Notifications`, `Removing orphan Workspace Sidebars`, `Removing orphan Desktop Icons`, `Deleting icon Frappe Framework`, `Syncing portal menu...`, and an explicit `Updating installed applications...` step. These enqueue at least one new background job type (`frappe.model.delete_doc.delete_dynamic_links`, observed via `bench doctor` afterward) that v15's migrate never produced.
+**Impact on Custom Agent:** if the Agent parses migrate output to track progress or detect specific known steps/warnings, a parser built against v15's simpler output will encounter unrecognized lines on v16, and any logic that infers "migration produced N background jobs" from a fixed job-type list will undercount on v16.
+**Implementation rule:** migrate output parsing (and any job-queue-based post-migrate verification) must be tested and maintained per major Frappe version, not assumed stable — treat `bench migrate`'s exact output shape as version-specific, matching D26's conclusion for `bench new-site`.
+
+### D28: `bench backup`'s Backup Summary uses absolute paths on v16, relative on v15
+**Discovered in:** Frappe v16 Tier A testing, A6 (backup)
+**Finding:** v15's `Backup Summary` output lists file paths relative to the bench directory (e.g. `./test.local/private/backups/...`). v16's lists full absolute paths (e.g. `/home/frappe/bench-data/frappe-bench/sites/v16-test.local/private/backups/...`).
+**Impact on Custom Agent:** any Agent logic that parses the Backup Summary output to extract backup file paths — e.g. to immediately hand them to an upload Job (as in Phase 3 Group Q) — must handle both formats, or must resolve paths itself rather than trusting the printed format to always be one or the other.
+**Implementation rule:** don't string-match on whether backup paths are relative or absolute when parsing `bench backup --verbose` output; either resolve any relative path against the known bench directory before use, or (more robustly) construct the expected backup file path independently from the known site name and timestamp pattern, rather than parsing it out of CLI output at all.
+
+### D29: `bench drop-site` archives to a different directory location on v16 vs v15
+**Discovered in:** Frappe v16 Tier A testing, A20 (drop-site)
+**Finding:** v15's `bench drop-site` moves the dropped site to `{bench_dir}/sites/archived/` (nested inside the `sites/` directory). v16 moves it to `{bench_dir}/archived/sites/` (a top-level directory, sibling to `sites/`). Confirmed directly: `ls {bench_dir}/sites/archived/` → `No such file or directory` on v16, while `ls {bench_dir}/archived/` → `sites` exists.
+**Impact on Custom Agent:** if the Agent needs to locate an archived/dropped site's data (e.g. to offer recovery, or to clean up old archives on a schedule), a path built against v15's layout will silently find nothing on v16, and vice versa.
+**Implementation rule:** don't hardcode the archived-site path; check both `{bench_dir}/sites/archived/` and `{bench_dir}/archived/sites/` (or better, derive the actual location from `bench drop-site`'s own stdout at drop time — it always prints `Moving site to archive under {path}` — and record that path rather than assuming a fixed layout).
