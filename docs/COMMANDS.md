@@ -929,3 +929,116 @@ See `RUNBOOK.md`, Decision Log **D12**, for the full record.
 | ⚡ Modified/needs config | 2 |
 | ❌ Fail | 0 |
 | **Total** | **4** |
+
+---
+
+## Phase 3: Image Building (Kaniko) + S3 Backup
+
+Verification of the two remaining pieces the original Docker-based Agent handled itself: building/pushing images (`docker buildx build` + `docker push`) and streaming backups to S3 (`mkfifo` + `rclone rcat`). Both replaced with K8s-native, Job-based patterns. Credentials (Docker Hub PAT, IDrive e2 access keys) were read once from local files, stored **only** as K8s Secrets (never committed, never printed via `--docker-password=`/`--from-literal=` on a visible command line — built as files and loaded via `--from-file`/`--from-env-file` instead), and the raw temp files were shredded immediately after each Secret was created.
+
+---
+
+## GROUP P — Kaniko Image Building
+
+---
+
+### Docker Hub registry secret
+**Original Agent uses:** `docker login -u {u} -p {p} {registry}` (Docker CLI credential store)
+**K8s equivalent:** `kubectl create secret generic {name} --from-file=.dockerconfigjson={path} --type=kubernetes.io/dockerconfigjson`
+**Status:** ✅ Pass
+**Modification:** Built the `.dockerconfigjson` locally and transferred via file rather than using `kubectl create secret docker-registry --docker-password=<value>` directly — avoids the token briefly appearing in the remote server's process list (`ps aux`) during the `kubectl` exec window. Used the Docker Hub **personal access token**, not the plaintext account password also present in the credential file (safer, revocable independently).
+**Verified by:** `kubectl get secret dockerhub-secret -n frappe-system` → `kubernetes.io/dockerconfigjson`, 1 data key.
+
+---
+
+### Kaniko build + push (replacing `docker buildx build` + `docker push`)
+**Original Agent uses:** `docker buildx build --platform linux/arm64 -t {image} .` then `docker push {image}`
+**K8s equivalent:** a `batch/v1` Job running `gcr.io/kaniko-project/executor`, Dockerfile mounted from a ConfigMap, registry auth mounted from the `dockerconfigjson` Secret at `/kaniko/.docker/config.json`
+**Status:** ✅ Pass
+**Modification:** None — the build+push mechanism itself worked cleanly and fast (15 seconds for a trivial `LABEL`-only Dockerfile; Kaniko correctly skipped re-unpacking the unchanged base image layers).
+**Verified by:** Job logs — `Pushed index.docker.io/ahmed3majeed/frappe-k3s-agent-test@sha256:92c3f1b8...`; real digest returned by Docker Hub.
+
+---
+
+### Verify pushed image is pullable
+**Original Agent uses:** implicit — a subsequent `docker run {image}` would fail if the push didn't actually work
+**K8s equivalent:** `kubectl run {name} --image={pushed-image} -- {cmd}`
+**Status:** ⚡ Pass with caveat
+**Modification:** No fix needed to the mechanism itself, but the first verification attempt **hung in `ContainerCreating` for 8+ minutes** with zero error events (just a persistent `Pulling image` event). Diagnosed: not disk space (132G free), not registry connectivity (fast response from `registry-1.docker.io`), not a bad image (a direct `crictl pull` on the node *did* eventually succeed). Most likely cause: **Docker Hub's anonymous-pull rate limit** — this node has done an enormous number of unauthenticated image pulls across this entire multi-session engagement, from a single IP. A throttled pull doesn't always surface as a hard kubelet error; it can just crawl silently. Once cached, a fresh verification pod completed in 6 seconds.
+**Verified by:** `verify-push3` → `Completed`, logs `Image pulled successfully`.
+**Implementation note:** the real Agent should pull its own images with `imagePullSecrets` (authenticated), not anonymously — authenticated pulls get a materially higher Docker Hub rate limit and avoid this exact multi-minute stall.
+
+---
+
+### Cleanup (Job + ConfigMap)
+**Original Agent uses:** N/A (Docker build artifacts are local, no separate cleanup step)
+**K8s equivalent:** `kubectl delete job {name}`, `kubectl delete configmap {name}`
+**Status:** ✅ Pass
+**Modification:** The Job was already gone by cleanup time — its own `ttlSecondsAfterFinished: 300` auto-deleted it during the P7 troubleshooting delay (confirms TTL-based Job cleanup works as configured; not a bug). ConfigMap deleted normally.
+**Note:** Kubernetes cleanup only removes in-cluster resources — the pushed test image itself (`ahmed3majeed/frappe-k3s-agent-test:latest`) remains on Docker Hub, since registry artifacts aren't a K8s concern.
+
+---
+
+## GROUP Q — S3 Backup (IDrive e2)
+
+---
+
+### IDrive e2 secret
+**Original Agent uses:** `rclone` config file with embedded S3 credentials
+**K8s equivalent:** `kubectl create secret generic {name} --from-env-file={path}`
+**Status:** ✅ Pass
+**Modification:** Same file-transfer discipline as the Docker Hub secret — never `--from-literal=access-key=<value>` on a visible command line.
+**Verified by:** `kubectl get secret idrive-e2-secret -n frappe-system` → `Opaque`, 3 data keys (access-key, secret-key, endpoint).
+
+---
+
+### bench backup → S3 upload (replacing `mkfifo` + `rclone rcat` streaming)
+**Original Agent uses:** named pipes inside the bench container + `rclone rcat` reading the FIFO from the agent host, requiring the agent and bench container to share a filesystem (true only for single-node Docker bind mounts)
+**K8s equivalent:** `bench backup` writes normal files to the PVC; a separate Job (mounting the *same* PVC) runs `aws s3 cp --recursive` to upload them — no FIFOs, no shared-filesystem assumption between agent and bench pod
+**Status:** ⚡ Pass with two modifications (both real spec bugs, not infrastructure issues)
+**Modification 1 — Secret namespace mismatch:** the given spec creates `idrive-e2-secret` in `frappe-system` but runs the upload Job in `frappe-v15`. K8s Secrets are namespace-scoped — the Job couldn't see it (`CreateContainerConfigError: secret "idrive-e2-secret" not found`). Fixed by copying the Secret's already-encoded data to `frappe-v15` via the K8s API directly (`kubectl get -o json | kubectl apply -n frappe-v15 -f -`), never re-touching the raw credential text.
+**Modification 2 — PVC path mismatch:** the given path (`/backup-source/sites/test.local/...`) assumes the PVC root *is* the bench directory. In this setup the PVC is mounted at `/home/frappe/bench-data`, with `bench init` creating `frappe-bench/` one level inside it (deliberate — `bench init` requires its target not to pre-exist, see Phase 1/Phase 2 K6). Real path: `/backup-source/frappe-bench/sites/test.local/...`. `aws s3 cp` failed cleanly with `The user-provided path ... does not exist` — fixed by correcting the manifest.
+**Verified by:** third attempt succeeded — `Upload complete: 0`, all 9 accumulated backup files uploaded; confirmed via `aws s3 ls` (Q5 below).
+
+---
+
+### Verify files on S3
+**K8s equivalent:** ephemeral Pod, `aws s3 ls s3://{bucket}/{prefix}/ --endpoint-url {idrive-endpoint}`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** 12 real files listed (3 backup sets × 4 files each), correct non-zero sizes.
+
+---
+
+### Download from S3 + restore (full cycle)
+**Original Agent uses:** N/A — restore-from-offsite-backup in the original design reads directly from S3 via `rclone`, not a two-step download-then-restore
+**K8s equivalent:** a Pod downloads from S3 onto the bench's PVC, then `bench restore` reads the local files normally
+**Status:** ✅ Pass
+**Modification:** The example command given for this step had no AWS credential env vars and no volume mount at all — couldn't have worked as literally written. Built a proper Pod manifest (`k3s/s3-download-pod.yaml`) mounting the same `bench-v15-data` PVC, downloading into a scratch subdirectory so the bench pod can reach the files directly (same underlying PVC, no cross-pod file transfer needed).
+**Verified by:** full cycle — backup → S3 upload → S3 download → `bench restore --with-public-files ... --with-private-files ...` → `Site test.local has been restored with files` → `bench --site test.local list-apps` still returns `frappe 15.118.0 version-15`. `test.local` intact throughout (restored from a backup of its own current state).
+**Note:** the download Pod ran as root, leaving root-owned files the `frappe` user couldn't delete without `sudo` — worth designing the real Agent's upload/download containers to run as the `frappe` UID when writing to a shared bench PVC.
+
+---
+
+### Cleanup S3 test data
+**K8s equivalent:** ephemeral Pod, `aws s3 rm s3://{bucket}/ --recursive --endpoint-url {idrive-endpoint}`
+**Status:** ✅ Pass
+**Modification:** None. All 12 test files deleted; bucket itself left in place (empty) since bucket deletion wasn't requested.
+
+---
+
+## Phase 3 Summary
+
+| Group | Steps | ✅ Pass | ⚡ Modified | ❌ Fail |
+|---|---|---|---|---|
+| P — Kaniko image building | 5 | 3 | 2 | 0 |
+| Q — S3 backup (IDrive e2) | 6 | 4 | 2 | 0 |
+| **Total** | **11** | **7** | **4** | **0** |
+
+**Two categories of finding worth carrying into the real Custom Agent's design:**
+1. **Registry pull throttling** — the Agent should always use authenticated (`imagePullSecrets`) pulls, even for its own images, to avoid Docker Hub's much stricter anonymous rate limit.
+2. **Namespace- and path-scoping discipline** — both Group Q bugs were spec mistakes that would silently break a real backup pipeline (a Secret invisible cross-namespace, a path assumption that didn't match the actual PVC layout). Any manifest template referencing a Secret or a PVC subpath needs to be verified against where those resources *actually* live, not assumed.
+
+Manifests: `k3s/kaniko-test-job.yaml`, `k3s/s3-upload-job.yaml` (both corrected versions), plus supporting one-off Pod manifests `k3s/s3-setup-pod.yaml`, `k3s/s3-verify-pod.yaml`, `k3s/s3-download-pod.yaml`, `k3s/s3-cleanup-pod.yaml`.
+
+Full raw output for every Phase 3 test: `RUNBOOK.md`, dated 2026-08-23, "Phase 3, GROUP P/Q" sections.
