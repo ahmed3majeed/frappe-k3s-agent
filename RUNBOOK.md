@@ -2119,3 +2119,81 @@ Bucket itself left in place (empty) — not deleted, since bucket deletion wasn'
 **Finding:** The S3 upload manifest assumed the PVC root directly contains `sites/` (i.e., `/backup-source/sites/test.local/...`), and failed with `aws: [ERROR]: The user-provided path /backup-source/sites/test.local/private/backups/ does not exist.` In this setup, the PVC (`bench-v15-data`) is mounted at `/home/frappe/bench-data`, and `bench init` created the actual bench one level inside that mount, at `frappe-bench/` (a deliberate choice from Phase 1/Phase 2 K6 — `bench init` requires its target directory not to already exist, so the PVC has to be mounted at the *parent* of `frappe-bench/`, not at `frappe-bench/` itself). So the real path from the PVC root is `frappe-bench/sites/test.local/...`, not `sites/test.local/...` directly.
 **Impact on Custom Agent:** every Job/Pod that mounts a bench's PVC to read or write site files (backup upload, backup download+restore, log collection, asset access, etc.) must account for this one-level offset — `{pvc-mount}/frappe-bench/sites/...`, never `{pvc-mount}/sites/...`. Getting this wrong doesn't corrupt anything, but it does fail cleanly with a "path does not exist" error, so it's a straightforward one-line fix once caught — the risk is it going unnoticed until the first real backup/restore is attempted.
 **Implementation rule:** any manifest template that mounts a bench PVC must reference paths as `{mountPath}/frappe-bench/sites/{site}/...`, matching the exact layout `k3s/bench-deployment.yaml` and `k3s/bench-pvc.yaml` establish (PVC mounted at `/home/frappe/bench-data`, bench created at `.../bench-data/frappe-bench/`). Treat this path prefix as a constant shared across every manifest template that touches bench data, not something to re-derive per Job.
+
+## 2026-08-23 — GROUP R: Full App Update Cycle
+
+Tests the complete workflow the Custom Agent must execute when Press requests an app update: fetch → diff → checkout → conditional pip/build/migrate → restart → verify.
+
+### Pre-flight checks (before touching anything)
+1. **Remote name:** confirmed via `git remote -v` → the remote is `upstream`, not `origin` (matches the Phase 1 Group B finding). The `origin` in the task spec would fail.
+2. **`bench-v15` resource type:** `kubectl get pod bench-v15 -n frappe-v15 -o jsonpath="{.metadata.ownerReferences}"` → **empty** — no owner. `kubectl get deployment,replicaset,statefulset -n frappe-v15` → none exist. **`bench-v15` is a fully bare, unmanaged Pod.** The task's R6 fallback assumption ("K8s will recreate it automatically" after `kubectl delete pod`) is **false** for an unmanaged Pod — only pods owned by a controller (Deployment/ReplicaSet/StatefulSet/DaemonSet/Job) get recreated on deletion. Confirmed the original pod manifest (`/home/frappe/manifests/frappe-v15/bench-pod.yaml`) is still saved on the server as a safety net before proceeding. See **D16** below.
+
+### R1: Baseline commit — ✅ Pass
+```
+$ git log --oneline -3
+9b8d265 chore(release): Bumped to Version 15.118.0
+16d483c Merge pull request #41779 from frappe/version-15-hotfix
+...
+$ git rev-parse HEAD
+9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+```
+**OLD_HASH = `9b8d265b27a1dfb11c7aef21a533a127e14a0a5a`**
+
+### R2: Fetch latest — ⚡ Pass with modification
+```
+$ git remote get-url origin
+error: No such remote 'origin'
+command terminated with exit code 2
+```
+Corrected to the real remote name:
+```
+$ git remote get-url upstream
+https://github.com/frappe/frappe.git
+$ git fetch --depth 2 upstream version-15 && git rev-parse FETCH_HEAD
+9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+```
+**NEW_HASH = `9b8d265b27a1dfb11c7aef21a533a127e14a0a5a`**
+
+**OLD_HASH == NEW_HASH** — no new commits have landed on `frappe/frappe`'s `version-15` branch since this bench was initialized. Per the task's own rule, **R3–R6 skipped**, proceeding directly to R7. (`test.local` was never at risk here — no `git reset --hard`/`git clean -fd`/checkout was run at all, since there was nothing to update to.)
+
+### R7: Verify site — ✅ Pass
+```
+$ bench --site test.local list-apps
+frappe 15.118.0 version-15
+$ bench --site test.local migrate
+...
+Executing `after_migrate` hooks...
+Queued rebuilding of search index for test.local
+```
+Clean, exit 0. `bench-v15` pod healthy throughout — never touched, since no update meant no restart was needed either.
+
+### R8: App Update Decision Tree
+
+| Changed files | Action |
+|---|---|
+| `*.vue`, `*.js` | `bench build --app {app}` |
+| `requirements*.txt`, `pyproject.toml` | `pip install -e {app}` |
+| `*/patches/*.py` | `bench migrate` |
+| `*.py` (non-patch) | rollout restart only |
+| No changes (`OLD_HASH == NEW_HASH`) | skip — already up to date |
+
+**Not exercised this run:** since no real update was available, R3 (diff categorization), R4 (checkout), R5 (conditional pip/build/migrate), and R6 (restart) never ran against real changed files — only the decision table above (as specified in the task) is documented, not empirically re-derived from an actual diff. Available on request: re-run against a deliberately older commit to exercise the full update path for real, if that's wanted.
+
+### GROUP R Summary
+
+| Step | Result |
+|---|---|
+| Pre-flight (remote name, pod ownership) | Caught 2 real issues before running anything |
+| R1 Baseline | ✅ Pass |
+| R2 Fetch latest | ⚡ Pass with modification (`origin` → `upstream`) |
+| R3–R6 | Skipped — no update available (per task's own rule) |
+| R7 Verify | ✅ Pass |
+| R8 Decision tree | ✅ Documented |
+
+## Decision Log Addition
+
+### D16: bare Pod vs. Deployment — restart/recreate semantics
+**Discovered in:** Group R (pre-flight check before R6)
+**Finding:** `bench-v15` (the original Phase 1 test bench) was created as a bare `kind: Pod` with no owning controller — `kubectl get pod bench-v15 -o jsonpath="{.metadata.ownerReferences}"` returns empty, and no Deployment/ReplicaSet/StatefulSet exists in `frappe-v15`. The Group R task instructions assumed that deleting this pod would trigger automatic recreation ("K8s will recreate it automatically") — **this is false for an unmanaged Pod.** Only pods owned by a controller get recreated on deletion; a bare Pod that's deleted is simply gone until something re-applies its manifest.
+**Impact on Custom Agent:** any restart/update logic the Agent runs (`kubectl rollout restart deployment/...` or a delete-and-recreate fallback) must know in advance whether the target is actually a controller-managed resource. Applying Deployment-style restart logic to a bare-Pod bench (as `bench-v15` still is, a holdover from before Group K's proper Deployment-based bench pattern existed) would either fail cleanly (`rollout restart` on a nonexistent Deployment) or, worse, silently destroy the pod if the delete-fallback were used without a saved manifest to reapply.
+**Implementation rule:** every bench the Agent manages must be a Deployment (as established in Phase 2 Group K's `k3s/bench-deployment.yaml` pattern) — never a bare Pod — specifically so that restart/update operations can rely on controller-managed recreation semantics. Before running any delete-based fallback on any resource, the Agent must first confirm the resource has an owning controller (non-empty `ownerReferences`); if not, either refuse the operation or ensure a manifest is available to reapply immediately after deletion, exactly as this test did as a precaution.
