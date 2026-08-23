@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-v16
+  namespace: frappe-v16
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-v16
+  template:
+    metadata:
+      labels:
+        app: redis-v16
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-secret
+      containers:
+        - name: redis-cache
+          image: redis:8-alpine
+          command: ["redis-server", "--port", "6379"]
+          ports:
+            - containerPort: 6379
+        - name: redis-queue
+          image: redis:8-alpine
+          command: ["redis-server", "--port", "6380"]
+          ports:
+            - containerPort: 6380
+        - name: redis-socketio
+          image: redis:8-alpine
+          command: ["redis-server", "--port", "6381"]
+          ports:
+            - containerPort: 6381
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-v16
+  namespace: frappe-v16
+spec:
+  selector:
+    app: redis-v16
+  ports:
+    - name: cache
+      port: 6379
+    - name: queue
+      port: 6380
+    - name: socketio
+      port: 6381

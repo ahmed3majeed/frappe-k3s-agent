@@ -2360,3 +2360,97 @@ Full audit of D1–D20 against a 20-item reference checklist found 3 findings th
 **Finding:** `bench --site {s} update-site-plan {plan}` fails with `Error: No such command 'update-site-plan'.` on a bench that only has the `frappe` app installed. This command is not part of the core Frappe framework's bench CLI — it's almost certainly provided by the `press` app (Frappe Cloud's own management app), which isn't installed in this environment.
 **Impact on Custom Agent:** if the Agent's site-plan/billing-tier logic assumes `update-site-plan` is always available as a bench command, it will fail on any bench that doesn't have the `press` app installed — which is the normal case for a bench that only runs customer apps.
 **Implementation rule:** do not depend on `update-site-plan` (or other `press`-app-specific bench commands) being available. If site-plan tracking is needed, the Agent should manage that state itself (e.g. in its own database/site_config) rather than relying on a command that only exists when a specific optional app is installed.
+
+## 2026-08-23 — Frappe v16 Testing Environment
+
+### Step 1: Check current Redis version — real finding, contradicts task premise
+```
+$ kubectl exec -n frappe-system redis-cache-master-0 -- redis-server --version
+Redis server v=8.10.1 ...
+```
+The task's context claimed `frappe-system` runs "Redis 6/7, NOT compatible with v16." **This is factually wrong** — it's been v8.10.1 since Phase 1 (the Bitnami chart's `latest` tag resolved to Redis 8 at original install time). Proceeded with a dedicated `redis-v16` instance anyway, since the task's *other* stated reason (isolation from v15) is independently valid.
+
+### Step 2: Namespace — ✅ Pass
+```
+$ kubectl create namespace frappe-v16
+namespace/frappe-v16 created
+```
+Also proactively copied `dockerhub-secret` from `frappe-system` into `frappe-v16` (applying D13's lesson) before deploying anything, to avoid anonymous-pull throttling risk.
+
+### Step 3: Deploy Redis 8 for v16 — ⚡ Pass with a real manifest bug found and fixed
+As-specified manifest (single container, 3 `containerPort`s):
+```
+$ redis-cli -p 6379 ping   → PONG
+$ redis-cli -p 6380 ping   → Could not connect to Redis at 127.0.0.1:6380: Connection refused
+$ redis-cli -p 6381 ping   → Could not connect to Redis at 127.0.0.1:6381: Connection refused
+```
+A single `redis-server` process only binds the one port it's configured for — declaring extra `containerPort`s doesn't make it listen anywhere else. **Fixed** by running 3 separate `redis-server` processes as sidecar containers in the same pod (`redis-cache`/`redis-queue`/`redis-socketio`, each with its own `--port` flag), keeping the single-Deployment/single-Service design. Re-verified: all 3 ports respond via the Service DNS name (`redis-v16.frappe-v16.svc.cluster.local`). See `k3s/redis-v16.yaml` (corrected version) and Decision Log **D24**.
+
+### Step 4: PVC — ✅ Pass
+`bench-v16-data`, 10Gi, `local-path` — `Pending` until claimed (expected), `Bound` once the bench Deployment (Step 5) started.
+
+### Step 5: bench Deployment — ✅ Pass
+Built as a proper Deployment from the start (Phase 2 Group K pattern, not a bare Pod like the original `bench-v15`), PVC mounted at `/home/frappe/bench-data` (parent of `frappe-bench/`, per D6/D15), `imagePullSecrets` attached (per D13).
+
+### Step 6: Python/Node versions — ✅ Pass
+```
+$ python3 --version → Python 3.14.2
+$ node --version → v24.13.0
+```
+Both well above the stated minimums (3.12+/22+).
+
+### Step 7: bench init — ✅ Pass
+```
+$ bench init frappe-bench --frappe-branch version-16 --skip-redis-config-generation
+...
+SUCCESS: Bench frappe-bench initialized
+```
+Confirms the `version-16` branch genuinely exists on `frappe/frappe`.
+
+### Step 8: Configure infrastructure hosts — ✅ Pass
+All four hosts (mariadb + 3× redis) written correctly to `common_site_config.json`, `redis://` scheme used throughout (per D3) — no host-format issues this time.
+
+### Step 9: Create test site — ✅ Pass
+```
+$ bench new-site v16-test.local --mariadb-user-host-login-scope='%' --db-host mariadb.frappe-system.svc.cluster.local --mariadb-root-username root --mariadb-root-password *** --admin-password ***
+...
+Creating Workspace Sidebars
+Creating Desktop Icons
+Updating Dashboard for frappe
+*** Scheduler is disabled ***
+```
+Two real behavioral differences from v15 noted: **no MariaDB version deprecation warning** (v15 always printed one), and **two extra install steps** ("Creating Workspace Sidebars", "Creating Desktop Icons") not present in v15's output.
+
+### Step 10: Verify — ✅ Pass
+```
+$ bench --version → 5.31.0
+$ python3 --version → Python 3.14.2
+$ node --version → v24.13.0
+$ bench --site v16-test.local list-apps
+frappe 16.31.0 version-16
+```
+
+### GROUP Summary
+
+| Step | Result |
+|---|---|
+| 1 Redis version check | Caught a wrong premise in the task context |
+| 2 Namespace | ✅ Pass |
+| 3 Redis v16 deploy | ⚡ Pass with a real manifest bug fixed |
+| 4 PVC | ✅ Pass |
+| 5 bench Deployment | ✅ Pass |
+| 6 Python/Node check | ✅ Pass |
+| 7 bench init | ✅ Pass |
+| 8 Host config | ✅ Pass |
+| 9 Create site | ✅ Pass — 2 real v15/v16 behavioral differences found |
+| 10 Verify | ✅ Pass |
+
+Full version comparison: `docs/VERSION-MATRIX.md`.
+
+## Decision Log Addition
+
+### D24: a single `redis-server` process only listens on the port it's configured for
+**Discovered in:** Frappe v16 environment setup, Step 3 (Redis deployment)
+**Finding:** A Kubernetes pod spec declaring multiple `containerPort` entries for one container does not make the process inside listen on all of them — `containerPort` is documentation/metadata for the kubelet and other tooling, not a listen directive. A single `redis-server` process only binds the port it was actually started with (default 6379). Confirmed directly: a manifest declaring `containerPort: 6379, 6380, 6381` for one `redis:8-alpine` container only ever answered on 6379; 6380/6381 refused connections.
+**Impact on Custom Agent:** if the Agent ever generates a manifest assuming "N declared container ports" implies "N listening services," any consumer expecting the extra ports (like Frappe's cache/queue/socketio Redis split) will fail to connect with no indication from the Kubernetes side that anything is wrong — the Deployment reports `Running`/`Available` regardless.
+**Implementation rule:** when a workload needs to expose multiple independent logical services (like Frappe's 3 Redis roles) from what could be one image, run one process per port — either as separate sidecar containers within one pod (each with its own `--port`/equivalent flag) or as fully separate Deployments — never rely on a single process implicitly listening on multiple declared `containerPort`s.
