@@ -1163,3 +1163,105 @@ Finding: The bench-v15 test pod (created in the Tier A/B setup) was never
 Implication: A real bench Deployment will need its own Service (and
              Deployment, replacing the bare test Pod) before Ingress/Traefik
              wiring can actually route traffic to it.
+
+## 2026-08-23 — Tier D: Direct MariaDB Operations (D1-D5)
+
+All commands run against `mariadb.frappe-system.svc.cluster.local` via ephemeral `kubectl run --rm -i` pods using `mariadb:10.11`.
+
+### D1: create temp user — ✅ Pass
+```
+$ kubectl run mariadb-test -n frappe-system --image=mariadb:10.11 --restart=Never --rm -i -- mysql -h mariadb.frappe-system.svc.cluster.local -u root -p*** -e "CREATE USER 'temp_test_user'@'%' IDENTIFIED BY ***; GRANT ALL PRIVILEGES ON *.* TO 'temp_test_user'@'%'; FLUSH PRIVILEGES; SELECT User, Host FROM mysql.user WHERE User='temp_test_user';"
+User	Host
+temp_test_user	%
+```
+**Note:** this grants `ALL PRIVILEGES ON *.*` — root-equivalent access from any host (`%`). Fine for a short-lived test user immediately dropped in D2, but worth flagging: not a pattern to reuse for any longer-lived credential.
+
+### D2: drop temp user — ✅ Pass
+```
+$ kubectl run mariadb-test2 ... -e "DROP USER 'temp_test_user'@'%'; FLUSH PRIVILEGES; SELECT User FROM mysql.user WHERE User='temp_test_user';"
+warning: couldn't attach to pod/mariadb-test2, falling back to streaming logs: ...
+pod "mariadb-test2" deleted from frappe-system namespace
+```
+`kubectl run --rm -i` occasionally can't attach in time when the pod finishes very fast (benign race, not a real failure) — so the SELECT output wasn't visible here. Verified independently with a follow-up pod:
+```
+$ kubectl run mariadb-test2b ... -e "SELECT User, Host FROM mysql.user WHERE User='temp_test_user';"
+(no rows)
+```
+Confirmed dropped.
+
+### D3: database size — ✅ Pass
+```
+$ kubectl run mariadb-test3 ... -e "SELECT table_schema AS 'Database', ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS 'Size (MB)' FROM information_schema.tables GROUP BY table_schema ORDER BY SUM(data_length + index_length) DESC;"
+Database	Size (MB)
+mysql	12.44
+_9354d31722f40d9e	11.93
+information_schema	0.20
+sys	0.03
+performance_schema	0.00
+```
+Confirms the actual site database name is `_9354d31722f40d9e` (Frappe's auto-generated hash), not `test_local`.
+
+### D4: list tables — ⚡ Pass with modification
+```
+$ kubectl run mariadb-test4 ... -e "USE test_local; SHOW TABLES;" 2>/dev/null || mysql -h ... -e "SHOW DATABASES;"
+ERROR 1049 (42000) at line 1: Unknown database 'test_local'
+pod "mariadb-test4" deleted from frappe-system namespace
+bash: line 13: mysql: command not found
+```
+**Two issues, both anticipated and confirmed before running:**
+1. `test_local` isn't a real database — the site is named `test.local` but its MariaDB database is the generated hash `_9354d31722f40d9e` (see D3).
+2. The `||` fallback isn't actually inside the pod — `kubectl run ... -- mysql ...` is one complete command; the `2>/dev/null || mysql ...` after it runs as plain shell on the **operator's own shell** (this SSH session on the k3s node), which has no `mysql` client installed (`command not found`). A fallback meant to run inside a container needs to be part of the pod's command (e.g. `sh -c "... || ..."` passed to `--`), not appended outside the `kubectl run` invocation.
+
+**Corrected:** used the real database name directly, in one pod:
+```
+$ kubectl run mariadb-test4b ... -e "USE _9354d31722f40d9e; SHOW TABLES;"
+Tables_in__9354d31722f40d9e
+__Auth
+__UserSettings
+__global_search
+tabAbout Us Team Member
+tabAccess Log
+... (full Frappe framework table set)
+```
+
+### D5: optimize tables — ⚡ Pass with modification
+```
+$ kubectl run mariadb-test5 ... -e "SELECT CONCAT('OPTIMIZE TABLE ', table_schema, '.', table_name, ';') FROM information_schema.tables WHERE table_schema = 'test_local' LIMIT 5;"
+(no rows) — EXIT: 0
+```
+Exit 0, but empty result — same `test_local` vs. actual db name issue as D4, not an error in itself.
+
+**Corrected:**
+```
+$ kubectl run mariadb-test5b ... -e "... WHERE table_schema = '_9354d31722f40d9e' LIMIT 5;"
+CONCAT('OPTIMIZE TABLE ', table_schema, '.', table_name, ';')
+OPTIMIZE TABLE _9354d31722f40d9e.tabPackage Release;
+OPTIMIZE TABLE _9354d31722f40d9e.tabEmail Group;
+OPTIMIZE TABLE _9354d31722f40d9e.tabList Filter;
+OPTIMIZE TABLE _9354d31722f40d9e.tabActivity Log;
+OPTIMIZE TABLE _9354d31722f40d9e.tabDynamic Link;
+```
+(Generates the OPTIMIZE statements; doesn't execute them — matches what was actually asked for.)
+
+### Tier D (D1-D5) Summary
+
+| ID | Operation | Result | Notes |
+|---|---|---|---|
+| D1 | create temp user | ✅ Pass | Grants ALL PRIVILEGES ON *.* — appropriate only for short-lived test creds |
+| D2 | drop temp user | ✅ Pass | `kubectl run` attach race hid output; verified independently |
+| D3 | database size | ✅ Pass | Revealed real db name `_9354d31722f40d9e` |
+| D4 | list tables | ⚡ Pass with modification | Wrong db name assumption + shell `||` fallback runs outside the pod |
+| D5 | optimize tables (dry) | ⚡ Pass with modification | Same wrong db name assumption |
+
+### D6: HOLD — command as given cannot do what it says
+
+```
+kubectl run mariadb-test6 -n frappe-system --image=mariadb:10.11 --restart=Never --rm -i -- mysql -h mariadb.frappe-system.svc.cluster.local -u root
+```
+
+Not run. Three problems, independent of each other:
+1. No `-p<password>` — `root` has a password set (confirmed throughout this project), so this would fail auth (or hang waiting on an interactive password prompt with no tty attached).
+2. No `-e "<query>"` — nothing to execute.
+3. **No `DROP DATABASE` statement anywhere** — despite the step title "Drop a test database," the command as given cannot drop anything.
+
+Dropping a database is irreversible and this MariaDB instance holds the real `_9354d31722f40d9e` (test.local) database alongside `mysql`/`sys`/`information_schema`. Rather than guess a target and write the DROP statement myself, stopping here to confirm the exact database name intended before running anything for D6.
