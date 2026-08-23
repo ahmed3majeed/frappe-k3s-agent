@@ -102,3 +102,33 @@ All commands tested identically to Phase 1 Tier A, against `v16-test.local` (ben
 | drop-site | ✅ | ⚡ | Archived sites move to a **top-level** `frappe-bench/archived/sites/` directory in v16, vs v15's `frappe-bench/sites/archived/` (nested inside `sites/`) — see D29 |
 
 **16/20 identical to v15, 5/20 show a real behavioral or structural difference** (new-site, install-app technique note, migrate, backup, doctor's queue contents as a migrate side-effect, and drop-site's archive location — counted as 5 distinct differences since doctor's change isn't independent of migrate's).
+
+---
+
+## Tier B + C Command Comparison: v15 vs v16
+
+| Command | v15 result | v16 result | Difference |
+|---|---|---|---|
+| uninstall-app (2 apps) | ✅ | ✅ | Same outcome; v16 shows extra "Deleting Desktop Icons"/"Deleting Workspace Sidebars" steps (same D27 theme) |
+| reinstall | ✅ | ✅ | Identical; same new lifecycle steps as A1/D26 |
+| execute get_installed_apps | ✅ | ✅ | Identical |
+| execute get_roles | ✅ | ✅ | Identical format (role *data* differs slightly — v16 has a "Marketing Manager" role v15 doesn't — but that's expected version drift, not a command behavior change) |
+| build-search-index | ⚡ enqueue-only (D9) | ✅ | Same — still only enqueues, confirmed via `doctor` |
+| rebuild-global-search | ✅ synchronous | ✅ | Same — still runs synchronously to 100% |
+| build (full) | ✅ | ✅ | Same output shape, ~18-19s build time |
+| setup requirements --python | ✅ | ✅ | Identical |
+| setup requirements --node | ✅ | ✅ | Identical |
+| ready-for-migration | ✅ | ✅ | Identical message and exit code |
+| remove-from-installed-apps | ✅ guardrail | ✅ | Identical guardrail behavior |
+| describe-database-table | ✅ | ✅ | Identical schema JSON shape |
+| add-database-index | ✅ | ✅ | Identical |
+| console (stdin) | ✅ | ✅ | Identical |
+| run-patch | ✅ verbose ("Executing... Success: Done in Xs") | ⚡ | **Completely silent on success** — exit 0, zero output, even with `2>&1` captured. See D30 |
+| pip install -e | ✅ | ✅ | Identical |
+| Rolling restart (kubectl) | ✅ | ✅ | Identical — new pod name, site data intact |
+| Scale down/up | ✅ | ✅ | Identical |
+| Patch resource limits | ✅ | ✅ | Identical, values applied correctly |
+| Add IngressRoute | ⚡ backend Service missing (D11) | ✅ | Same pattern — no `bench-v16` Service exists either, so IngressRoute creates fine but Traefik logs `kubernetes service not found`. Also confirms double-quote `Host("...")` syntax (used in this task, vs backtick syntax used in Phase 2) parses without error in this Traefik version |
+| Remove IngressRoute | ✅ | ✅ | Identical |
+
+**28/29 identical to v15, 1/29 shows a real behavioral difference** (run-patch verbosity).

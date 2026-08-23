@@ -2586,3 +2586,106 @@ v16 archives dropped sites at a **top-level** `frappe-bench/archived/sites/` dir
 **Finding:** v15's `bench drop-site` moves the dropped site to `{bench_dir}/sites/archived/` (nested inside the `sites/` directory). v16 moves it to `{bench_dir}/archived/sites/` (a top-level directory, sibling to `sites/`). Confirmed directly: `ls {bench_dir}/sites/archived/` → `No such file or directory` on v16, while `ls {bench_dir}/archived/` → `sites` exists.
 **Impact on Custom Agent:** if the Agent needs to locate an archived/dropped site's data (e.g. to offer recovery, or to clean up old archives on a schedule), a path built against v15's layout will silently find nothing on v16, and vice versa.
 **Implementation rule:** don't hardcode the archived-site path; check both `{bench_dir}/sites/archived/` and `{bench_dir}/archived/sites/` (or better, derive the actual location from `bench drop-site`'s own stdout at drop time — it always prints `Moving site to archive under {path}` — and record that path rather than assuming a fixed layout).
+
+## 2026-08-23 — Tier B + C: Command Testing on Frappe v16
+
+Full comparison table: `docs/VERSION-MATRIX.md`. B3-B7, B13, B16 skipped as instructed (already covered in Tier A).
+
+### B1: uninstall-app (2 apps) — ✅ Same as v15
+Installed `erpnext --branch version-16` (branch exists, cloned fine), installed on site, then:
+```
+$ echo -e "admin123\nadmin123" | bench --site v16-test.local uninstall-app erpnext --no-backup --yes --force
+...
+Deleting Desktop Icons
+Deleting Workspace Sidebars
+Uninstalled App erpnext from Site v16-test.local
+```
+Same outcome as v15; extra "Deleting ..." steps match the D27 lifecycle-hook theme. `list-apps` confirmed `frappe` only afterward. Cleaned up: `bench remove-app erpnext` (same archive pattern as v15: `archived/apps/erpnext-2026-08-23`).
+
+### B2: reinstall — ✅ Same as v15
+```
+$ bench --site v16-test.local reinstall --yes --admin-password *** --mariadb-root-username root --mariadb-root-password ***
+...
+App frappe already installed
+*** Scheduler is enabled ***
+```
+Site verified healthy after (`list-apps` → `frappe 16.31.0 version-16`).
+
+### B8/B9: execute get_installed_apps / get_roles — ✅ Same as v15
+Identical output shape. (Role *data* differs slightly — v16 includes a "Marketing Manager" role not present in v15 — but that's normal version drift in Frappe's built-in roles, not a command behavior change.)
+
+### B10: build-search-index — ✅ Same as v15 (D9 confirmed)
+Still only enqueues (`Retrieving Routes: 3%`, exit 0), confirmed via `doctor` showing the job queued.
+
+### B11: rebuild-global-search — ✅ Same as v15
+Still runs synchronously to 100%.
+
+### B12: build (full) — ✅ Same as v15
+~18.5s, same output shape.
+
+### B14/B15: setup requirements --python / --node — ✅ Same as v15
+
+### B17: ready-for-migration — ✅ Same as v15
+```
+NOT READY for migration: site v16-test.local has pending background jobs
+```
+Same message, same exit 1.
+
+### B18: remove-from-installed-apps — ✅ Same as v15
+Same core-app guardrail: `You cannot remove or uninstall the app frappe`.
+
+### B19/B20: describe-database-table / add-database-index — ✅ Same as v15
+
+### B21: console via stdin — ✅ Same as v15
+
+### B22: run-patch — ⚡ Different from v15
+First located a real v16 patch (`ls apps/frappe/frappe/patches/v16_0/`) rather than guessing a name (lesson from Phase 1 D3). Found `auto_generate_desktop_icon_and_sidebar.py` in that listing — very likely the actual source of D26/D27's new "Workspace Sidebars"/"Desktop Icons" steps.
+```
+$ bench --site v16-test.local run-patch frappe.patches.v16_0.switch_default_sort_order
+EXIT: 0
+(no output)
+$ bench --site v16-test.local run-patch frappe.patches.v16_0.set_reply_to_header 2>&1
+EXIT: 0
+(no output — re-verified with explicit 2>&1 capture to rule out a truncation artifact)
+```
+v15's equivalent test printed an explicit `Executing frappe.patches.v14_0.update_workspace2 in test.local (...)` / `Success: Done in 0.587s` message. v16 is **completely silent** on success — exit 0, zero output either way. See **D30**.
+
+### B23: pip install -e — ✅ Same as v15
+
+### C1: Rolling restart — ✅ Same as v15
+New pod name confirmed (`...-5846f9dcfc-8tpqr` → `...-677465d49-2jh7w`), site data intact after.
+
+### C2/C3: Scale down/up — ✅ Same as v15
+Pods briefly show `Terminating` past a quick check (same grace-period timing as before, not a stuck state). Data intact after scale-up.
+
+### C4: Patch resource limits — ✅ Same as v15
+`Limits: cpu 500m, memory 1Gi` / `Requests: cpu 250m, memory 512Mi` — applied exactly as specified.
+
+### C5: Add IngressRoute — ✅ Same pattern as v15 (D11), plus a syntax clarification
+```
+$ kubectl apply -f - <<EOF ... match: Host("v16-test.local") ... EOF
+ingressroute.traefik.io/v16-test-domain created
+```
+Created fine (K8s API doesn't validate Traefik's matcher DSL at admission time). Checked Traefik's own logs to see whether the double-quote `Host("...")` syntax (as given in this task, vs the backtick `Host(\`...\`)` syntax used successfully in Phase 2) actually parsed:
+```
+ERR error="kubernetes service not found: frappe-v16/bench-v16" ingress=v16-test-domain namespace=frappe-v16
+```
+The only error is the missing backend Service (matches D11 exactly — no `bench-v16` Service exists, same as `bench-v15` originally didn't) — **no syntax error**, confirming double-quoted `Host("...")` is valid syntax in this Traefik version, not just backticks.
+
+### C6: Remove IngressRoute — ✅ Same as v15
+
+### Tier B+C v16 Summary
+
+| Result | Count |
+|---|---|
+| ✅ Same as v15 | 28 |
+| ⚡ Different from v15 | 1 (B22, run-patch verbosity) |
+| ❌ Fails on v16 | 0 |
+
+## Decision Log Addition
+
+### D30: `bench run-patch` is silent on success in v16, verbose in v15
+**Discovered in:** Frappe v16 Tier B testing, B22 (run-patch)
+**Finding:** On v15, `bench --site {s} run-patch {patch}` printed an explicit `Executing {patch} in {site} ({db_name})` line followed by `Success: Done in {N}s` on completion. On v16, the identical command structure produces **zero output** on success (confirmed with two different real v16-specific patches, and re-verified with explicit `2>&1` capture to rule out a stream-redirection artifact) — only the exit code (0) indicates success.
+**Impact on Custom Agent:** if the Agent parses `run-patch` stdout to confirm a patch actually executed (e.g. looking for "Success: Done" text, as would be a reasonable approach based on v15's behavior), that check will incorrectly report failure on every v16 patch run, even though the patch succeeded (exit 0).
+**Implementation rule:** verify `run-patch` success by exit code only, never by matching specific output text — this is doubly important given output verbosity for this exact command changed between major Frappe versions with no announced deprecation. If confirmation beyond exit code is needed, check the patch's actual effect directly (e.g. query the `Patch Log` doctype) rather than parsing CLI text.
