@@ -1010,3 +1010,156 @@ Implication: In a bare bench-CLI pod (no worker processes), this command will
              anything. A real deployment needs a running worker (e.g. a
              `bench worker` Deployment) for this — and other queued jobs like
              contact creation — to actually execute.
+
+## 2026-08-23 — Tier C: Kubernetes-Native Operations
+
+All commands run on the server as `frappe`, `KUBECONFIG=/home/frappe/.kube/config`.
+
+**Pre-check finding:** `frappe-system` has **no Deployments at all** — the Bitnami redis chart deploys `redis-cache-master`/`redis-cache-replicas` (and same for queue/socketio) as **StatefulSets**, even with persistence disabled (Bitnami's chart always uses a StatefulSet for the Redis master, for stable network identity). This meant every command in the C2–C5 spec (`deployment redis-cache`) needed correcting to `statefulset redis-cache-master` before it could work — confirmed via `kubectl get deployments/statefulsets -n frappe-system` and `kubectl get all | grep redis-cache` first.
+
+### C1: create namespace — ✅ Pass
+```
+$ kubectl create namespace frappe-test-bench
+namespace/frappe-test-bench created
+```
+
+### C2: rolling restart — ⚡ Pass with modification
+```
+$ kubectl rollout restart deployment redis-cache -n frappe-system
+Error from server (NotFound): deployments.apps "redis-cache" not found
+```
+**Corrected:**
+```
+$ kubectl rollout restart statefulset redis-cache-master -n frappe-system
+statefulset.apps/redis-cache-master restarted
+$ kubectl rollout status statefulset redis-cache-master -n frappe-system --timeout=60s
+statefulset rolling update complete 1 pods at revision redis-cache-master-5b89d6db85...
+```
+
+### C3: scale down — ⚡ Pass with modification
+```
+$ kubectl scale deployment redis-cache -n frappe-system --replicas=0
+Error from server (NotFound): deployments.apps "redis-cache" not found
+```
+**Corrected:**
+```
+$ kubectl scale statefulset redis-cache-master -n frappe-system --replicas=0
+statefulset.apps/redis-cache-master scaled
+$ kubectl get pods -n frappe-system | grep redis-cache
+redis-cache-master-0   1/1   Terminating   0   30s
+```
+Confirmed fully scaled to 0 shortly after (`grep redis-cache` → no results).
+
+### C4: scale up — ⚡ Pass with modification
+```
+$ kubectl scale deployment redis-cache -n frappe-system --replicas=1
+Error from server (NotFound): deployments.apps "redis-cache" not found
+```
+**Corrected:**
+```
+$ kubectl scale statefulset redis-cache-master -n frappe-system --replicas=1
+statefulset.apps/redis-cache-master scaled
+$ kubectl rollout status statefulset redis-cache-master -n frappe-system --timeout=60s
+statefulset rolling update complete 1 pods at revision redis-cache-master-5b89d6db85...
+```
+
+### C5: patch resources — ⚡ Pass with modification
+Container name in the spec is `redis` — matches what was given, only the resource type/name needed correcting.
+```
+$ kubectl patch deployment redis-cache -n frappe-system --patch '...'
+Error from server (NotFound): deployments.apps "redis-cache" not found
+```
+**Corrected:**
+```
+$ kubectl patch statefulset redis-cache-master -n frappe-system --patch '{"spec":{"template":{"spec":{"containers":[{"name":"redis","resources":{"requests":{"memory":"64Mi","cpu":"50m"},"limits":{"memory":"128Mi","cpu":"100m"}}}]}}}}'
+statefulset.apps/redis-cache-master patched
+$ kubectl rollout status statefulset redis-cache-master -n frappe-system --timeout=60s
+statefulset rolling update complete 1 pods at revision redis-cache-master-7d6d6d48fb...
+```
+Verified applied: `kubectl get pod ... -o jsonpath='{.spec.containers[0].resources}'` →
+```
+{"limits":{"cpu":"100m","ephemeral-storage":"2Gi","memory":"128Mi"},"requests":{"cpu":"50m","ephemeral-storage":"50Mi","memory":"64Mi"}}
+```
+(`ephemeral-storage` values come from the chart's default `resourcesPreset`, not this patch — CPU/memory match exactly what was requested.)
+
+### C6: delete namespace — ✅ Pass
+```
+$ kubectl delete namespace frappe-test-bench
+namespace "frappe-test-bench" deleted
+$ kubectl get namespace frappe-test-bench
+Error from server (NotFound): namespaces "frappe-test-bench" not found
+Namespace deleted
+```
+
+### C7: create Ingress — ⚡ Pass with caveat
+```
+$ kubectl apply -f - <<EOF ... EOF
+ingress.networking.k8s.io/test-site-ingress created
+Warning: annotation "kubernetes.io/ingress.class" is deprecated, please use 'spec.ingressClassName' instead
+$ kubectl get ingress -n frappe-v15
+NAME                CLASS    HOSTS        ADDRESS     PORTS   AGE
+test-site-ingress   <none>   test.local   10.0.0.37   80      0s
+```
+**Unexpected findings:**
+1. `CLASS` shows `<none>` because the legacy `kubernetes.io/ingress.class` annotation doesn't populate `spec.ingressClassName` (hence the deprecation warning) — but `kubectl get ingressclass` confirms `traefik` is the **default** IngressClass in this cluster, so Traefik still picks it up (`Address: 10.0.0.37` confirms it was processed).
+2. `kubectl describe ingress` shows the backend as `bench-v15:8000 (<error: services "bench-v15" not found>)` — **the `bench-v15` pod was created directly with no Service in front of it** (back when it was first created for the Tier A/B tests), so this Ingress resource creates fine but is not actually functional yet. A Service would need to be added first for real traffic to reach it.
+
+### C8: delete Ingress — ✅ Pass
+```
+$ kubectl delete ingress test-site-ingress -n frappe-v15
+ingress.networking.k8s.io "test-site-ingress" deleted from frappe-v15 namespace
+$ kubectl get ingress -n frappe-v15
+No resources found in frappe-v15 namespace.
+```
+
+### C9: maintenance-mode annotation — ⚡ Pass with caveat
+```
+$ kubectl apply -f - <<EOF ... EOF
+ingress.networking.k8s.io/test-maintenance-ingress created
+$ kubectl get ingress -n frappe-v15 -o yaml | grep -A5 annotations
+    annotations:
+      kubernetes.io/ingress.class: traefik
+      traefik.ingress.kubernetes.io/router.middlewares: |
+        frappe-v15-maintenance@kubernetescrd
+```
+Annotation applied and readable as expected. **Unexpected findings:**
+1. The YAML `>` folded-scalar style used for the middleware annotation value adds a trailing newline (visible as `frappe-v15-maintenance@kubernetescrd\n` in `last-applied-configuration`) — cosmetically harmless here, but worth using `|-` or a plain scalar instead in real manifests to avoid a stray newline in an annotation value some parsers might not trim.
+2. No Traefik `Middleware` custom resource named `maintenance` exists yet in `frappe-v15` — this annotation references a middleware that doesn't exist, so it would have no actual effect until that CRD is created. Ingress object creation itself doesn't validate that referenced Middleware CRDs exist.
+
+Cleaned up: `kubectl delete ingress test-maintenance-ingress -n frappe-v15` → deleted, confirmed via `kubectl get ingress -n frappe-v15` → no resources.
+
+### Tier C Summary
+
+| ID | Operation | Result | Notes |
+|---|---|---|---|
+| C1 | create namespace | ✅ Pass | — |
+| C2 | rolling restart | ⚡ Pass with modification | `deployment redis-cache` → `statefulset redis-cache-master` |
+| C3 | scale down | ⚡ Pass with modification | Same resource-type/name correction |
+| C4 | scale up | ⚡ Pass with modification | Same resource-type/name correction |
+| C5 | patch resources | ⚡ Pass with modification | Same correction; values verified applied |
+| C6 | delete namespace | ✅ Pass | — |
+| C7 | create Ingress | ⚡ Pass with caveat | Created fine, but backend Service `bench-v15` doesn't exist |
+| C8 | delete Ingress | ✅ Pass | — |
+| C9 | maintenance annotation | ⚡ Pass with caveat | Applied fine, but referenced Middleware CRD doesn't exist; YAML folding added trailing newline |
+
+**4/9 passed cleanly, 5/9 passed with a required modification or a caveat worth flagging.** The dominant theme: `frappe-system`'s Redis/MariaDB workloads are StatefulSets, not Deployments (Bitnami chart default), and `frappe-v15`'s bench pod has no Service/Ingress-wiring yet — both are useful groundwork findings for whatever manifests get built next for a real bench deployment.
+
+## Decision Log (additions)
+
+### D10: Redis/MariaDB workload type in frappe-system
+Question: Are the shared infra workloads Deployments or StatefulSets?
+Finding: All of them (mariadb, redis-cache/queue/socketio master+replicas) are
+         StatefulSets — Bitnami's redis chart always uses a StatefulSet for
+         the master pod, even with persistence disabled and 0 replicas.
+Implication: Any kubectl automation targeting these by name must use
+             `statefulset <name>-master`, not `deployment <name>`, and the
+             resource name has a `-master` suffix, not the bare release name.
+
+### D11: bench-v15 has no Service yet
+Finding: The bench-v15 test pod (created in the Tier A/B setup) was never
+         given a Kubernetes Service. An Ingress pointing at it is created
+         successfully but non-functional (`<error: services "bench-v15" not
+         found>`) until a Service is added.
+Implication: A real bench Deployment will need its own Service (and
+             Deployment, replacing the bare test Pod) before Ingress/Traefik
+             wiring can actually route traffic to it.
