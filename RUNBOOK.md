@@ -2220,3 +2220,166 @@ git fetch --depth 1 origin {branch}
 **Finding:** `SELECT @@performance_schema;` → `0` on this MariaDB instance — disabled by default. Confirmed identically in two independent tests. The `events_statements_summary_by_digest` query itself is valid and doesn't error while disabled, it just returns 0 rows.
 **Impact on Custom Agent:** any slow-query-analysis or performance-report feature the Agent offers (mirroring the original Agent's `performance_schema` queries) will silently return empty results, not an error, unless the MariaDB server was configured with performance_schema enabled from the start. A silent empty result is easy to mistake for "no slow queries" rather than "the feature isn't actually on."
 **Implementation rule:** add `[mysqld] performance_schema=ON` to the MariaDB config (`custom.cnf`) at server setup time — this requires a MariaDB restart to take effect, so it must be decided during initial infrastructure provisioning, not toggled on-demand per query.
+
+## 2026-08-23 — GROUP RS: Real App Update Flow (End-to-End)
+
+Group R was skipped (OLD_HASH == NEW_HASH, no real update available). This test simulates a real update by deliberately rolling `apps/frappe` back 3 commits, then running the full update flow forward against `upstream/version-15`.
+
+### RS1: Baseline
+```
+$ git log --oneline -5    # only showed 2 (shallow clone, depth 2) — deepened first
+$ git fetch --depth 10 upstream version-15
+$ git log --oneline -6
+9b8d265 chore(release): Bumped to Version 15.118.0
+16d483c Merge pull request #41779 ...
+5145f2a Merge pull request #41769 ...
+d6028ef Merge pull request #41708 ...
+0ecfb97 test: resolve backport conflict in workflow tests
+9e527c5 Merge pull request #41771 ...
+```
+**CURRENT_HEAD = `9b8d265b27a1dfb11c7aef21a533a127e14a0a5a`**. Per the task's own "4th line back" rule: **OLD_COMMIT = `d6028ef`**.
+
+### RS2: Roll back — ✅ Pass
+```
+$ git reset --hard d6028ef
+HEAD is now at d6028ef Merge pull request #41708 ...
+```
+
+### RS3: Fetch (simulate update trigger) — ✅ Pass
+```
+$ git fetch --depth 5 upstream version-15 && git rev-parse FETCH_HEAD
+9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+```
+**NEW_HASH = `9b8d265...`** — confirmed different from OLD_COMMIT, 3 commits apart as designed.
+
+### RS4: Detect changes — ✅ Pass
+```
+$ git diff --name-only HEAD FETCH_HEAD | wc -l
+3
+$ git diff --name-only HEAD FETCH_HEAD
+frappe/__init__.py
+frappe/workflow/doctype/workflow/test_workflow.py
+frappe/workflow/doctype/workflow_action/workflow_action.py
+```
+Frontend: **none**. Dependencies: **none**. Patches/migrations: **none**. Python-only: **all 3 files**. A small, real, low-risk update — exactly the kind that should map to "code update + restart only," no build/pip/migrate needed.
+
+### RS5: Apply update — ✅ Pass
+```
+$ git clean -fd && git checkout FETCH_HEAD
+HEAD is now at 9b8d265 chore(release): Bumped to Version 15.118.0
+```
+(Detached HEAD — see RS9's finding on why this matters.)
+
+### RS6: Conditional steps — all SKIPPED (correctly)
+No frontend, dependency, or patch changes detected in RS4 → `pip install -e`, `bench build`, and `bench migrate` were all correctly skipped per the "only run what applies" rule. Since the app is installed in editable mode (Phase 1 Group D finding), the new Python code took effect immediately on checkout — no reinstall needed for pure code changes.
+
+### RS7: Restart options — both tested, both fail as expected (confirms D16)
+**Option A:**
+```
+$ kubectl rollout restart pod/bench-v15 -n frappe-v15
+error: pods "bench-v15" restarting is not supported
+```
+Exact, unambiguous kubectl error for attempting a Deployment-style rollout on a bare Pod.
+
+**Option B:**
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "pkill -f frappe ..."
+command terminated with exit code 143
+```
+Interesting failure mode: exit 143 (SIGTERM) — `pkill -f frappe` matched and killed **its own invoking shell**, since the `bash -c` command line itself contains the substring "frappe" (via `/home/frappe/...`, `frappe-bench`, etc.). Confirmed the pod itself was unaffected: `kubectl get pod bench-v15` → `Running`, `0` restarts, unchanged age; `ps aux` inside the pod still shows PID 1 as `sleep infinity`. **`pkill -f` pattern matching is not just unnecessary here — it's actively unsafe**, since almost any reasonable pattern is likely to match the invoking shell's own command line inside a path like `/home/frappe/bench-data/frappe-bench/...`.
+**Conclusion (matches D16):** in production, restart must be `kubectl rollout restart deployment/{bench-name}` against a real Deployment — this is exactly why every real bench must be created as a Deployment (Phase 2 Group K pattern), never a bare Pod.
+
+### RS8: Verify after update — ✅ Pass
+```
+$ bench --site test.local list-apps
+frappe 15.118.0 version-15
+$ bench --site test.local migrate
+...
+Executing `after_migrate` hooks...
+```
+Exit 0, clean.
+
+### RS9: Restore to CURRENT_HEAD — ⚡ Pass with a real, notable finding
+
+First attempt:
+```
+$ git checkout 9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+HEAD is now at 9b8d265 chore(release): Bumped to Version 15.118.0
+$ bench --site test.local list-apps
+frappe 15.118.0 HEAD          ← was "version-15" before Group RS started!
+```
+**Right commit, wrong branch label.** Investigated: `git checkout <hash>` (as literally specified) restores the *commit content* but leaves the repo in **detached HEAD**, not back on the named `version-15` branch.
+
+Attempted fix #1 — `git checkout version-15`:
+```
+Your branch is behind 'upstream/version-15' by 9 commits, and can be fast-forwarded.
+$ git log --oneline -1
+d6028ef Merge pull request #41708 ...    ← wrong commit!
+```
+Deeper root cause found: RS2's `git reset --hard d6028ef` ran *while the `version-15` branch was checked out*, so it moved the **local branch pointer itself** back to `d6028ef`. Every checkout after that (RS3 fetch, RS5's `checkout FETCH_HEAD`, this first RS9 attempt) used detached HEAD, so the `version-15` branch ref was never updated — it sat stuck at `d6028ef` for the rest of the test.
+
+Fix #2 — reset the branch to the correct commit while it's checked out:
+```
+$ git reset --hard 9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+$ git branch --show-current
+version-15
+$ bench --site test.local list-apps
+frappe 15.118.0 HEAD          ← still wrong! git state is now fully correct though.
+```
+Git itself was now fully correct (`git rev-parse --abbrev-ref HEAD` → `version-15`, `.git/HEAD` → `ref: refs/heads/version-15`), but `list-apps` still showed `HEAD`. Traced the actual source (not bench's own `get_current_branch`, since `bench --site X list-apps` is a **Frappe framework command**, not a bench-CLI command): `frappe/commands/site.py`'s `list_apps()` reads `app.git_branch` from the **`Installed Applications` DocType in the site's database** — a value written during `bench migrate`, not re-derived live from git on every call. RS8's `migrate` ran while the repo was in detached HEAD, so `git symbolic-ref -q --short HEAD` (empty on detached HEAD) resolved to the literal string `"HEAD"`, and *that* got persisted into the database.
+
+**Real fix:** re-ran `bench --site test.local migrate` once more, now that the repo was correctly on the `version-15` branch:
+```
+$ bench --site test.local migrate
+...
+$ bench --site test.local list-apps
+frappe 15.118.0 version-15      ← fully restored
+```
+
+**Final verified state:**
+```
+HEAD commit: 9b8d265b27a1dfb11c7aef21a533a127e14a0a5a
+Branch: version-15
+Status: (clean)
+```
+`bench-v15` pod: `Running`, `0` restarts, unchanged age throughout — never touched.
+
+### RS10: App Update Decision Tree (empirically derived from RS4)
+
+| Change type | Detected? | Action taken |
+|---|---|---|
+| Frontend (`*.js`/`*.vue`/`*.jsx`) | ✗ | skipped |
+| Dependencies (`requirements*.txt`, `pyproject.toml`) | ✗ | skipped |
+| Patches/migrations (`patches/`, `migrations/`) | ✗ | skipped |
+| Python (non-patch) | ✓ (3 files) | code took effect immediately via editable install; `bench migrate` still run as a general post-update sanity check |
+
+### GROUP RS Summary
+
+| Step | Result |
+|---|---|
+| RS1 Baseline | ✅ Pass (had to deepen shallow clone first) |
+| RS2 Roll back | ✅ Pass |
+| RS3 Fetch | ✅ Pass |
+| RS4 Detect changes | ✅ Pass |
+| RS5 Apply update | ✅ Pass |
+| RS6 Conditional steps | ✅ Pass (all correctly skipped) |
+| RS7 Restart (both options) | ✅ Pass (both fail as expected, confirming D16) |
+| RS8 Verify after update | ✅ Pass |
+| RS9 Restore to CURRENT_HEAD | ⚡ Pass with a real, multi-layered finding (see D19) |
+| RS10 Decision tree | ✅ Documented |
+
+**9/9 steps completed, one of them (RS9) surfacing a genuinely important, non-obvious finding about how `bench migrate` and detached-HEAD checkouts interact.**
+
+## Decision Log Additions
+
+### D19: git checkout must target a branch, never a detached commit/FETCH_HEAD
+**Discovered in:** Group RS, RS9 (surfaced while restoring state after the simulated update)
+**Finding:** `git checkout {hash}` / `git checkout FETCH_HEAD` correctly updates the working tree content but leaves the repo in **detached HEAD** state. This is invisible to most operations (the app runs fine, git itself reports the right commit) — but `bench --site {s} migrate` calls `git symbolic-ref -q --short HEAD` to determine the app's current branch, which returns empty on a detached HEAD, and that resolves to the literal string `"HEAD"` being written into the site's `Installed Applications` DocType (`git_branch` field) — persisted in the **database**, not just a cosmetic git-state issue. Every subsequent `bench --site {s} list-apps` then shows `"HEAD"` instead of the real branch name, and this does **not** self-correct until `migrate` runs again while the repo is properly on a named branch. Separately, if a `git reset --hard {hash}` is run while a named branch happens to be checked out, it silently moves that branch's own ref pointer — so a later `git checkout {branch-name}` doesn't land where you'd expect, either.
+**Impact on Custom Agent:** any update flow that fetches a new commit and applies it via `git checkout {hash}` (rather than a branch name) will leave the bench in detached HEAD. The very next `bench migrate` (a completely normal, expected step in the same update flow) will then corrupt the site's own app-version bookkeeping — a real, persisted regression, not a transient display glitch. This is a correctness bug that's easy to ship: everything appears to work (the app functions correctly), and the only symptom is a wrong branch label that most tests wouldn't think to check.
+**Implementation rule:** the Agent's update flow must **never** `git checkout <commit-hash>` or `git checkout FETCH_HEAD` directly against a bench's app repo. Instead: fast-forward the actual branch ref (`git checkout {branch} && git merge --ff-only {fetched-hash}`, or equivalently `git checkout -B {branch} {fetched-hash}` if the branch needs to be reset to match), so the repo is always left on a named branch before `bench migrate` (or any other step that queries the current branch) ever runs.
+
+### D20: `pkill -f` is unsafe for identifying processes to restart inside a bench pod
+**Discovered in:** Group RS, RS7 (Option B restart test)
+**Finding:** `pkill -f frappe` run via `kubectl exec -n {ns} {pod} -- bash -c "pkill -f frappe"` killed its own invoking shell process (exit code 143/SIGTERM) rather than reporting "no matching process." Root cause: `pkill -f` matches against the full command line of every process, and the `bash -c` command line itself contains the substring "frappe" (via paths like `/home/frappe/bench-data/frappe-bench/...`). The pod's actual PID 1 (`sleep infinity`) was correctly unaffected, since its command line contains no such substring — but any exec'd command whose own invocation happens to match the search pattern is at risk of self-terminating.
+**Impact on Custom Agent:** if the Agent ever uses `pkill -f <pattern>` (or similar broad process-matching) inside a bench container to restart a specific process, it must guarantee the pattern cannot also match the invoking shell's own command line — otherwise the operation can silently kill the wrong thing (its own exec session) while reporting a generic-looking non-zero exit, easy to misread as "nothing to kill."
+**Implementation rule:** avoid `pkill -f` with broad substrings for any in-container process management. Prefer exact PID targeting (from `pgrep`/`ps` filtered on a narrow, unambiguous pattern verified not to match the shell invocation itself), or — better — avoid in-container process signaling entirely and rely on `kubectl rollout restart deployment/{bench}` (which restarts the whole pod cleanly via the controller, per D16/D19), rather than trying to kill individual processes inside a running container.
