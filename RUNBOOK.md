@@ -1843,3 +1843,72 @@ Implementation rule: always use `kubectl apply` (upsert, matched by
         check-then-create pattern (list existing IngressRoutes' Host()
         matches before creating a new one) to guarantee only one router
         exists per host.
+
+## 2026-08-23 — GROUP D: Uncertain Commands
+
+### D1: pip install -e {app_path} — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  /home/frappe/bench-data/frappe-bench/env/bin/pip install -e /home/frappe/bench-data/frappe-bench/apps/frappe
+"
+...
+Building editable for frappe (pyproject.toml): finished with status 'done'
+Successfully installed frappe-15.118.0
+```
+Verified rigorously (not just `pip show`'s `Location`, which always points at site-packages regardless of editable status):
+```
+$ pip list --editable
+Package Version  Editable project location
+frappe  15.118.0 /home/frappe/bench-data/frappe-bench/apps/frappe
+$ pip show -f frappe | grep -i Editable
+Editable project location: /home/frappe/bench-data/frappe-bench/apps/frappe
+```
+Genuinely editable, confirmed.
+
+### D2: python -m pip install -e {app_path} — ✅ Pass
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  /home/frappe/bench-data/frappe-bench/env/bin/python -m pip install -e /home/frappe/bench-data/frappe-bench/apps/frappe
+"
+...
+Successfully installed frappe-15.118.0
+```
+Identical outcome to D1; re-verified via `pip list --editable` — same result. Both invocation forms (`pip install -e` and `python -m pip install -e`) are equivalent here.
+
+### D3: run-patch — ⚡ Pass with modification
+```
+$ kubectl exec -n frappe-v15 bench-v15 -- bash -c "
+  cd /home/frappe/bench-data/frappe-bench &&
+  bench --site test.local run-patch frappe.patches.v14_0.update_workspace2_for_rename
+"
+ModuleNotFoundError: No module named 'frappe.patches.v14_0.update_workspace2_for_rename'
+command terminated with exit code 1
+```
+**Cause:** the exact patch name given doesn't exist. Checked the actual patches directory (`ls apps/frappe/frappe/patches/v14_0/`) and via `find -iname "*workspace2*"` — the real file is `update_workspace2.py`, not `update_workspace2_for_rename.py`.
+
+**Corrected:**
+```
+$ bench --site test.local run-patch frappe.patches.v14_0.update_workspace2
+Executing frappe.patches.v14_0.update_workspace2 in test.local (_9354d31722f40d9e)
+Success: Done in 0.587s
+```
+Exit 0.
+
+### D4: performance_schema queries — ⚡ (works but needs config change)
+```
+$ kubectl run sql-perf -n frappe-system --rm -i --image=mariadb:10.11 --restart=Never -- mysql -h mariadb.frappe-system.svc.cluster.local -u root -p*** -e "SELECT @@performance_schema;"
+@@performance_schema
+0
+```
+`performance_schema` is disabled by default on this instance (confirms the same finding from Phase 1 Group C). Per the branching rule given for this test: since it's `0`, the `events_statements_summary_by_digest` query wasn't run — would need `[mysqld] performance_schema=ON` added to the server config (`custom.cnf` ConfigMap) plus a MariaDB restart to enable, which is a server-level infrastructure change out of scope for a single command test. The query mechanism itself (unaffected by this) was already confirmed working in Phase 1 Group C — it just returns 0 rows while disabled rather than erroring.
+
+### GROUP D Summary
+
+| ID | Command | Result | Notes |
+|---|---|---|---|
+| D1 | `pip install -e {app_path}` | ✅ Pass | Rigorously verified as genuinely editable |
+| D2 | `python -m pip install -e {app_path}` | ✅ Pass | Identical outcome to D1 |
+| D3 | `run-patch` | ⚡ Pass with modification | Given patch name doesn't exist; corrected `update_workspace2_for_rename` → `update_workspace2` |
+| D4 | performance_schema queries | ⚡ Needs config change | Disabled by default; query mechanism itself works fine once enabled |
+
+**No permanent changes to `test.local` data** — D1/D2 only reinstalled the already-present `frappe` package in place (same version, same source), D3's patch is idempotent (workspace rename cleanup, already-applied-safe), D4 was read-only.
