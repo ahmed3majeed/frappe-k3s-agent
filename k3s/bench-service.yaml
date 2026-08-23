@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-test
+  namespace: frappe-test
+spec:
+  selector:
+    app: bench-test
+  ports:
+    - name: web
+      port: 8000
+      targetPort: 8000
+    - name: socketio
+      port: 9000
+      targetPort: 9000

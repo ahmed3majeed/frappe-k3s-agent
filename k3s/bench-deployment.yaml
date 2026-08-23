@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-test
+  namespace: frappe-test
+  labels:
+    app: bench-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bench-test
+  template:
+    metadata:
+      labels:
+        app: bench-test
+    spec:
+      containers:
+        - name: bench
+          image: frappe/bench:latest
+          command: ["sleep", "infinity"]
+          volumeMounts:
+            - name: bench-data
+              mountPath: /home/frappe/bench-data
+      volumes:
+        - name: bench-data
+          persistentVolumeClaim:
+            claimName: bench-test-data

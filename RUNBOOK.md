@@ -1525,3 +1525,104 @@ Both ✅ Pass. No real connection was touched — the killed connection was crea
 | ❌ Fail | 1 |
 | ⏭️ Deferred (needs replica, per Group J) | 4 (`STOP/START SLAVE`, `CHANGE MASTER TO`, `SHOW SLAVE STATUS`) |
 | **Total** | **32 / 32 testable + 4 deferred** |
+
+## 2026-08-23 — Phase 2, GROUP K: Full Bench Lifecycle (frappe-test / bench-test)
+
+Building a complete bench from scratch as proper K8s resources (Namespace + PVC + Deployment + Service + IngressRoute), replacing what the original Docker Agent did with `docker run -d --name {bench} {image}`. All manifests saved to `k3s/`.
+
+### K1: Namespace
+```
+$ kubectl create namespace frappe-test
+namespace/frappe-test created
+```
+
+### K2: PVC (`k3s/bench-pvc.yaml`)
+```
+$ kubectl apply -f k3s/bench-pvc.yaml
+persistentvolumeclaim/bench-test-data created
+$ kubectl get pvc -n frappe-test
+bench-test-data   Pending   ...   local-path
+```
+`Pending` is expected — `local-path` storage class uses `WaitForFirstConsumer` binding, resolves once a pod claims it (confirmed at K3).
+
+### K3: Deployment (`k3s/bench-deployment.yaml`)
+```
+$ kubectl apply -f k3s/bench-deployment.yaml
+deployment.apps/bench-test created
+$ kubectl wait --for=condition=Available deployment/bench-test -n frappe-test --timeout=60s
+deployment.apps/bench-test condition met
+$ kubectl get pods -n frappe-test
+bench-test-69f6bdfc87-fpvf4   1/1   Running
+$ kubectl get pvc -n frappe-test
+bench-test-data   Bound   10Gi   local-path
+```
+PVC bound as soon as the pod scheduled, as expected.
+
+### K4: Service (`k3s/bench-service.yaml`)
+```
+$ kubectl apply -f k3s/bench-service.yaml
+service/bench-test created
+$ kubectl get svc -n frappe-test
+bench-test   ClusterIP   10.43.145.221   8000/TCP,9000/TCP
+```
+
+### K5: IngressRoute (`k3s/bench-ingressroute.yaml`)
+Pre-check: confirmed Traefik CRDs installed (`ingressroutes.traefik.io`, `middlewares.traefik.io`, apiVersion `traefik.io/v1alpha1` — matches spec exactly) before writing the manifest.
+```
+$ kubectl apply -f k3s/bench-ingressroute.yaml
+ingressroute.traefik.io/bench-test created
+```
+Unlike the dangling test Ingress from Tier C7 (which pointed at a nonexistent Service), this one references the real `bench-test` Service created at K4 — genuinely wired up, not just a valid-but-empty resource.
+
+### K6: bench init
+```
+$ kubectl exec -n frappe-test bench-test-69f6bdfc87-fpvf4 -- bash -c "
+  cd /home/frappe/bench-data &&
+  bench init frappe-bench --frappe-branch version-15 --skip-redis-config-generation
+"
+...
+SUCCESS: Bench frappe-bench initialized
+```
+Clean pass, no errors — the PVC was mounted directly at `/home/frappe/bench-data` (one level above `frappe-bench`) and `--skip-redis-config-generation` was included from the start, avoiding both issues discovered the hard way during the original `bench-v15` setup (Tier A/Phase 1).
+
+### K7: Configure infrastructure hosts
+```
+$ kubectl exec ... -- bash -c "
+  bench set-mariadb-host mariadb.frappe-system.svc.cluster.local &&
+  bench set-redis-cache-host redis://redis-cache-master.frappe-system.svc.cluster.local:6379 &&
+  bench set-redis-queue-host redis://redis-queue-master.frappe-system.svc.cluster.local:6380 &&
+  bench set-redis-socketio-host redis://redis-socketio-master.frappe-system.svc.cluster.local:6381
+"
+```
+All four hosts correctly written to `common_site_config.json` with the `redis://` scheme from the start (learned from the Tier A fix — the spec here already included it correctly).
+
+### K8: Create site
+```
+$ bench new-site k8s-test.local --mariadb-user-host-login-scope='%' --db-host mariadb.frappe-system.svc.cluster.local --mariadb-root-username root --mariadb-root-password *** --admin-password ***
+...
+Updating Dashboard for frappe
+*** Scheduler is disabled ***
+```
+Clean pass, exit 0.
+
+### K9: Verify
+```
+$ bench --site k8s-test.local list-apps
+frappe 15.118.0 version-15
+```
+
+### GROUP K Summary
+
+| Step | Result |
+|---|---|
+| K1 Namespace | ✅ Pass |
+| K2 PVC | ✅ Pass |
+| K3 Deployment | ✅ Pass |
+| K4 Service | ✅ Pass |
+| K5 IngressRoute | ✅ Pass |
+| K6 bench init | ✅ Pass |
+| K7 Host config | ✅ Pass |
+| K8 new-site | ✅ Pass |
+| K9 Verify | ✅ Pass |
+
+**9/9 clean — zero modifications needed this time.** Every issue hit during the original bare-Pod bench setup (Tier A: PVC mount path, missing `--skip-redis-config-generation`, missing `redis://` scheme) was designed around correctly from the start here, since a proper Deployment+Service+IngressRoute is what a real bench actually needs in production.
