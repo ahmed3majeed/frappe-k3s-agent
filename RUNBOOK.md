@@ -1739,3 +1739,58 @@ maintenance   0s
 | M4 Maintenance middleware | ✅ Pass |
 
 **4/4 clean.** Domain/routing changes in K8s are pure `kubectl apply`/`delete` of IngressRoute/Middleware resources — no reload step needed (Traefik watches the API server directly), confirming the master list's own Group G conclusion.
+
+## 2026-08-23 — Phase 2, GROUP N: Bench Archive and Cleanup
+
+Replaces `docker rm`/`docker stack rm`.
+
+### N1: Archive bench (keep data, remove pod) — ✅ Pass
+```
+$ kubectl scale deployment/bench-test --replicas=0 -n frappe-test
+$ kubectl delete deployment bench-test -n frappe-test
+$ kubectl delete service bench-test -n frappe-test
+$ kubectl delete ingressroute --all -n frappe-test
+  → deleted: bench-test, custom-domain
+$ kubectl get pvc -n frappe-test
+bench-test-data   Bound   10Gi   local-path
+```
+PVC survives independently of the Deployment/Service/IngressRoute — exactly the "archive" semantics needed (data kept, compute/routing removed).
+
+### N2: Restore archived bench from existing PVC — ✅ Pass
+```
+$ kubectl apply -f k3s/bench-deployment.yaml
+deployment.apps/bench-test created
+```
+New pod (`bench-test-598cd6f676-kgx7w`) bound to the **same** PVC. Verified bench data survived intact:
+```
+$ kubectl exec ... -- ls /home/frappe/bench-data/frappe-bench/sites/
+apps.json  apps.txt  assets  common_site_config.json  k8s-test.local
+$ bench --site k8s-test.local list-apps
+frappe 15.118.0 version-15
+```
+Full archive → restore cycle confirmed working end-to-end with zero data loss.
+
+### N3: Full cleanup (delete namespace) — ✅ Pass
+```
+$ kubectl delete namespace frappe-test
+namespace "frappe-test" deleted
+$ kubectl get namespace frappe-test
+Error from server (NotFound): namespaces "frappe-test" not found
+```
+Confirmed `frappe-v15`/`bench-v15` (the protected test bench) completely untouched throughout Group N:
+```
+$ kubectl get namespace frappe-v15
+frappe-v15   Active   4h27m
+$ kubectl get pods -n frappe-v15
+bench-v15    1/1   Running   4h21m
+```
+
+### GROUP N Summary
+
+| Step | Result |
+|---|---|
+| N1 Archive (keep PVC) | ✅ Pass |
+| N2 Restore from PVC | ✅ Pass |
+| N3 Full cleanup | ✅ Pass |
+
+**3/3 clean.** The archive/restore pattern (PVC survives independent of Deployment/Service lifecycle) is the direct K8s equivalent of Docker's "stop the container, keep the bind-mounted data, `docker rm`" pattern — confirmed working with a real bench, not just an empty volume.
