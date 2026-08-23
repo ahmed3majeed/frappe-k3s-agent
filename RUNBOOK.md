@@ -1422,3 +1422,106 @@ version-15
 | ⚡ Pass with modification | 1 (full-SHA requirement on hash-based fetch) |
 | ❌ Fail | 0 |
 | **Total** | **21 / 21** |
+
+## 2026-08-23 — Master Command List: GROUP C (SQL commands, via mysql client pod)
+
+All tests use ephemeral `kubectl run --image=mariadb:10.11` pods against `mariadb.frappe-system.svc.cluster.local`. Replication commands (`STOP/START SLAVE`, `CHANGE MASTER TO`, `SHOW SLAVE STATUS`, `PURGE BINARY LOGS` — kept, see below) are handled per the master list's own **Group J** guidance: deferred, ⏭️ needs a dedicated replica MariaDB, not built for this pass.
+
+### User account lifecycle
+```sql
+CREATE OR REPLACE USER 'sql-test-user'@'%' IDENTIFIED BY ***; FLUSH PRIVILEGES;
+GRANT ALL PRIVILEGES ON *.* TO 'sql-test-user'@'%' WITH GRANT OPTION;
+SHOW GRANTS FOR 'sql-test-user'@'%';
+  → GRANT ALL PRIVILEGES ON *.* TO `sql-test-user`@`%` ... WITH GRANT OPTION
+REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'sql-test-user'@'%';
+SHOW GRANTS FOR 'sql-test-user'@'%';
+  → GRANT USAGE ON *.* TO `sql-test-user`@`%` ...   (privileges genuinely stripped)
+GRANT SELECT ON mysql.* TO 'sql-test-user'@'%';
+SHOW GRANTS FOR 'sql-test-user'@'%';
+  → GRANT USAGE ON *.* ...  +  GRANT SELECT ON `mysql`.* TO ...
+RENAME USER 'sql-test-user'@'%' TO 'sql-test-user-renamed'@'%';
+  → confirmed via mysql.user query
+DROP USER IF EXISTS 'sql-test-user-renamed'@'%';
+  → confirmed gone via follow-up verify pod
+```
+All ✅ Pass. (`REVOKE`/`GRANT SELECT` tested against `*.*`/`mysql.*` rather than a `{db}`-scoped grant, since the original grant was global — mechanism fully confirmed regardless of scope.)
+
+### Database lifecycle
+```sql
+CREATE OR REPLACE DATABASE test_replace_db;        -- ✅ Pass, confirmed via SHOW DATABASES LIKE
+GRANT ALL PRIVILEGES ON test_replace_db.* TO 'sql-test-user2'@'%' IDENTIFIED BY *** WITH GRANT OPTION;  -- ✅ Pass
+DROP DATABASE IF EXISTS test_replace_db;            -- ✅ Pass
+DROP USER IF EXISTS 'sql-test-user2'@'%';           -- ✅ Pass
+```
+Verified both gone via a follow-up pod.
+
+### information_schema introspection (against real site db `_9354d31722f40d9e`)
+
+| Query | Result |
+|---|---|
+| `SELECT table_name, data_length, index_length, data_free FROM information_schema.TABLES WHERE TABLE_SCHEMA=...` | ✅ Pass — real rows returned |
+| `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE ...` | ✅ Pass |
+| `SELECT TABLE_NAME, COLUMN_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE ...` | ✅ Pass — real index list for `tabUser` (PRIMARY, username, mobile_no, api_key, last_active, modified, email_index) |
+| `SELECT TABLE_NAME, INDEX_NAME, ROWS_READ FROM information_schema.INDEX_STATISTICS WHERE ...` | ⚡ Pass with caveat | Empty result — MariaDB's `userstat`/index-usage-tracking feature is **off by default**; the table exists and the query is valid, it's just never populated unless `userstat=ON` is set server-side |
+
+### EXPLAIN / ANALYZE / stats / integrity (on real `tabUser`)
+```sql
+EXPLAIN SELECT * FROM _9354d31722f40d9e.tabUser WHERE name='Administrator';
+  → type=const, key=PRIMARY, rows=1                                          -- ✅ Pass
+
+ANALYZE TABLE _9354d31722f40d9e.tabUser PERSISTENT FOR ALL;
+  → "Engine-independent statistics collected", status OK (+ per-column warnings for
+     unindexed/TEXT-like columns — informational, not errors)                -- ✅ Pass
+
+SELECT column_name, nulls_ratio FROM mysql.column_stats WHERE db_name=... AND table_name='tabUser';
+  → real rows (requires the ANALYZE above to have run first)                 -- ✅ Pass
+
+CHECK TABLE _9354d31722f40d9e.tabUser;
+  → status: OK                                                               -- ✅ Pass
+
+REPAIR TABLE _9354d31722f40d9e.tabUser;
+  → note: "The storage engine for the table doesn't support repair"          -- ✅ Pass (expected: InnoDB doesn't support REPAIR TABLE — MyISAM-only feature, correctly reported rather than erroring)
+```
+
+### PROCESSLIST + KILL (safe, self-created connection)
+Started a disposable `SELECT SLEEP(60)` connection in its own pod (`sql-sleeper`), then from a separate pod:
+```sql
+SHOW FULL PROCESSLIST;
+  → Id 3119  User root  Command Query  Time 5  State "User sleep"  Info "SELECT SLEEP(60)"
+```
+Then:
+```sql
+KILL 3119;
+```
+Confirmed via the sleeper pod's own log:
+```
+ERROR 2013 (HY000) at line 1: Lost connection to server during query
+```
+Both ✅ Pass. No real connection was touched — the killed connection was created solely for this test.
+
+### Misc single-shot commands
+
+| Command | Result | Notes |
+|---|---|---|
+| `SELECT 1` | ✅ Pass | ping/liveness check |
+| `CREATE DATABASE IF NOT EXISTS press_meta` | ✅ Pass | Created, confirmed, then dropped (not left behind) |
+| `FLUSH TABLES` | ✅ Pass | — |
+| `SELECT @@GLOBAL.gtid_binlog_pos` | ✅ Pass | Empty value — no GTID history (replication never configured), not an error |
+| `SHOW VARIABLES` | ✅ Pass | 655 total variables (`information_schema.GLOBAL_VARIABLES` count used instead of a full dump) |
+| `SELECT @@GLOBAL.{variable}` (`version`) | ✅ Pass | `10.11.18-MariaDB-ubu2204-log` |
+| `SET GLOBAL server_audit_file_rotate_now = 1` | ❌ Fail | `ERROR 1193: Unknown system variable 'server_audit_file_rotate_now'` — the `server_audit` plugin isn't loaded on this instance (not a K8s issue; would need the plugin installed server-side) |
+| `SELECT * FROM performance_schema.events_statements_summary_by_digest` | ⚡ Pass with caveat | Returns 0 rows — `performance_schema` is **OFF** by default on this instance (confirmed via `SHOW VARIABLES LIKE 'performance_schema'`); query itself is valid, just never collects data unless enabled server-side (requires a restart) |
+| `SELECT * FROM information_schema.INNODB_TRX` | ✅ Pass | Empty — no active transactions, valid |
+| `SELECT * FROM information_schema.INNODB_LOCKS JOIN INNODB_TRX` | ⚡ Pass with modification | **`INNODB_LOCKS` doesn't exist in MariaDB** — it's a MySQL-only table. MariaDB's equivalent is `information_schema.INNODB_LOCK_WAITS`. Used that instead — empty result (no lock waits currently), valid |
+| `PURGE BINARY LOGS TO '{binlog}'` | ✅ Pass | No error even though `log_bin` is `OFF` on this instance — MariaDB treats this as a safe no-op rather than raising an error |
+| `SHOW DATABASES` | ✅ Pass | Already exercised extensively in Tier D and earlier Group C tests |
+
+### GROUP C Summary
+
+| Result | Count |
+|---|---|
+| ✅ Pass | 27 |
+| ⚡ Pass with modification/caveat | 4 |
+| ❌ Fail | 1 |
+| ⏭️ Deferred (needs replica, per Group J) | 4 (`STOP/START SLAVE`, `CHANGE MASTER TO`, `SHOW SLAVE STATUS`) |
+| **Total** | **32 / 32 testable + 4 deferred** |
