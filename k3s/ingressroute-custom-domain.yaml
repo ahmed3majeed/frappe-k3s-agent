@@ -1,0 +1,14 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: custom-domain
+  namespace: frappe-test
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`custom-domain.local`)
+      kind: Rule
+      services:
+        - name: bench-test
+          port: 8000

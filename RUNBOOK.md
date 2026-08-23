@@ -1684,3 +1684,58 @@ Requests:
 | L4 Patch resources | ✅ Pass |
 
 **4/4 clean.** All standard Deployment-native operations — no custom Agent logic needed beyond issuing the right `kubectl` command against the right resource.
+
+## 2026-08-23 — Phase 2, GROUP M: Domain and Routing Management
+
+Replaces nginx.conf editing + `nginx -s reload`.
+
+### M1: Add domain (new IngressRoute) — ✅ Pass
+```
+$ kubectl apply -f - <<EOF ... EOF
+ingressroute.traefik.io/k8s-test-domain created
+$ kubectl get ingressroute -n frappe-test
+bench-test        6m33s
+k8s-test-domain   0s
+```
+Note: this used the **same host** (`k8s-test.local`) as the existing `bench-test` IngressRoute from K5 — a genuine near-duplicate rather than a new domain. Both created successfully; Traefik doesn't reject duplicate host matches at admission time (each becomes its own router). Removed at M3 before it could cause any real routing ambiguity.
+
+### M2: Add second (distinct) domain — ✅ Pass
+```
+$ kubectl apply -f - <<EOF ... (host: custom-domain.local) EOF
+ingressroute.traefik.io/custom-domain created
+$ kubectl get ingressroute -n frappe-test
+bench-test        6m42s
+custom-domain     0s
+k8s-test-domain   9s
+```
+Saved to `k3s/ingressroute-custom-domain.yaml`.
+
+### M3: Remove domain — ✅ Pass
+```
+$ kubectl delete ingressroute k8s-test-domain -n frappe-test
+ingressroute.traefik.io "k8s-test-domain" deleted from frappe-test namespace
+$ kubectl get ingressroute -n frappe-test
+bench-test      6m50s
+custom-domain   8s
+```
+Confirmed gone; `bench-test` (K5) and `custom-domain` (M2) both still intact.
+
+### M4: Maintenance mode middleware — ✅ Pass
+```
+$ kubectl apply -f - <<EOF ... EOF
+middleware.traefik.io/maintenance created
+$ kubectl get middleware -n frappe-test
+maintenance   0s
+```
+`kubectl describe` confirms the `redirectRegex` spec applied correctly. Saved to `k3s/middleware-maintenance.yaml`. (Not attached to any IngressRoute in this test — only resource creation was in scope; wiring a Middleware to a route via `traefik.ingress.kubernetes.io/router.middlewares`-style reference was already exercised conceptually in Tier C9.)
+
+### GROUP M Summary
+
+| Step | Result |
+|---|---|
+| M1 Add domain | ✅ Pass |
+| M2 Add second domain | ✅ Pass |
+| M3 Remove domain | ✅ Pass |
+| M4 Maintenance middleware | ✅ Pass |
+
+**4/4 clean.** Domain/routing changes in K8s are pure `kubectl apply`/`delete` of IngressRoute/Middleware resources — no reload step needed (Traefik watches the API server directly), confirming the master list's own Group G conclusion.

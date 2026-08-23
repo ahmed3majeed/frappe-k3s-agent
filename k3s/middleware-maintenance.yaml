@@ -1,0 +1,9 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: maintenance
+  namespace: frappe-test
+spec:
+  redirectRegex:
+    regex: ".*"
+    replacement: "http://maintenance.yourdomain.com"
