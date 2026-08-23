@@ -2699,3 +2699,115 @@ Full audit of every Decision Log entry in this document against a 30-item refere
 **Finding:** `git fetch --depth 1 {remote} {hash}` fails when given an abbreviated hash: `git fetch --depth 1 upstream 16d483c` → `fatal: couldn't find remote ref 16d483c`. GitHub's server-side SHA-fetch (`uploadpack.allowTipSHA1InWant`/`allowReachableSHA1InWant`) only resolves full 40-character SHAs, not abbreviated ones — even though the same short hash works fine locally (`git rev-parse`, `git log`, `git diff`) once the commit is already present in the local object database. Confirmed the fix directly: `git fetch --depth 1 upstream 16d483c2095d57a080c664dba3e19a0421739719` (full SHA) succeeded.
 **Impact on Custom Agent:** if the Agent's update-fetch logic resolves a target commit to a short/abbreviated hash anywhere in its pipeline (e.g. from a truncated display value, a short-form API response, or a locally-abbreviated `git log` parse) and passes that directly to `git fetch`, the fetch will fail with a confusing "couldn't find remote ref" error that gives no indication the actual problem is hash length.
 **Implementation rule:** always resolve and pass the full 40-character commit SHA to `git fetch {remote} {hash}` — never an abbreviated form. If the Agent only has a short hash on hand, resolve it to the full form first via a already-fetched local ref (`git rev-parse {short-hash}`) before it can be used in a subsequent `git fetch` call.
+
+## 2026-08-23 — Frappe v14 Environment Setup + Tier A
+
+### S1: Resource check — plenty available
+128G disk free (13% used), 21Gi RAM available, 4% CPU. No concerns proceeding.
+
+### S2-S5: Namespace, secrets, Redis, PVC, Deployment — ✅ All pass
+Same patterns as v16 (D14, D24, D16 lessons applied from the start): `dockerhub-secret` copied to `frappe-v14`; `redis-v14` deployed as 3 sidecar containers (cache/queue/socketio on 6379/6380/6381), all 3 ports verified responding; `bench-v14-data` PVC (10Gi) bound; `bench-v14` Deployment (not bare Pod) running.
+
+### S6: Python/Node/bench versions — same image as v15/v16
+`Python 3.14.2`, `v24.13.0`, bench `5.31.0` — identical to v15/v16 (same `frappe/bench:latest` image, unpinned).
+
+### S7: bench init — ❌ then ⚡ Pass with modification (real Python-version incompatibility, fixed)
+
+**Attempt 1 (default Python 3.14) — FAILED:**
+```
+× Failed to build `pypika==0.48.9`
+AttributeError: module 'ast' has no attribute 'Str'
+hint: `pypika` (v0.48.9) was included because `frappe` (v14.101.1) depends on `pypika==0.48.9`
+```
+`ast.Str` was deprecated in Python 3.8 and **removed in Python 3.12+**. Frappe v14 hard-pins `pypika==0.48.9`, whose `setup.py` still uses `ast.Str` to read its version — incompatible with the image's Python 3.14.
+
+**Attempt 2 (`--python /usr/bin/python3.11`) — FAILED differently (progress):**
+The `ast.Str` error was gone (3.11 still has it, deprecated but not removed) — but a new error appeared:
+```
+fatal error: Python.h: No such file or directory
+hint: `hiredis` (v2.0.0) was included because `frappe` (v14.101.1) depends on `hiredis`
+```
+`/usr/bin/python3.11` (system Python, distinct from the image's pyenv-managed 3.14) has no dev headers installed, needed to compile `hiredis`'s C extension.
+
+**Fix:** `sudo apt-get install -y python3.11-dev` (passwordless sudo available in this image), then retried:
+```
+$ bench init frappe-bench --frappe-branch version-14 --skip-redis-config-generation --python /usr/bin/python3.11
+...
+SUCCESS: Bench frappe-bench initialized
+```
+See **D32**.
+
+### S8: Configure hosts — ✅ Pass
+Same `redis://` pattern as v15/v16 (D3), all 4 hosts correctly written.
+
+### S9: Create site — ⚡ Pass with modification
+```
+$ bench new-site v14-test.local --mariadb-user-host-login-scope='%' ...
+Error: No such option: --mariadb-user-host-login-scope
+```
+Confirmed via `bench new-site --help`: this flag **doesn't exist at all** in v14's bench CLI — it's a v15+ addition (D5 already noted `--no-mariadb-socket` is deprecated *in v15*, implying it still exists there; v14 predates the replacement flag entirely and only has the old one). Retried with `--no-mariadb-socket` → succeeded. Two new steps not seen in v15/v16: `Restoring Database file...` and `Updating country info`. No MariaDB version deprecation warning suppressed — it still appeared (`Warning: MariaDB version ['10.11', '18'] is more than 10.8...`), same as v15. See **D33**.
+
+### S10: Verify — ⚡ Different output format
+```
+$ bench --site v14-test.local list-apps
+frappe
+```
+Just the bare app name — **no version number, no branch**, unlike v15/v16's `frappe {version} {branch}`. Confirmed via `list-apps -f json` too (`{"v14-test.local": ["frappe"]}`, no version field) and via `sites/apps.json` directly (`"version": "14.101.1"` — the real version is tracked, just not displayed by `list-apps`). See **D34**.
+
+### Tier A Tests on v14 (17 commands)
+
+| # | Command | Result | Notes |
+|---|---|---|---|
+| 1 | migrate | ✅ Same as v15 | No v16-style extra steps (those are v16-specific patches) |
+| 2 | migrate --skip-failing | ✅ Same | — |
+| 3 | migrate --skip-search-index | ✅ Same | Correctly omits reindex message |
+| 4 | backup --with-files --verbose | ⚡ Different | Uses `mysqldump` (not `mariadb-dump`) and the older `self=$$; (mysqldump ... \|\| kill $self) \| gzip` self-kill shell pattern. Paths still **relative** (matches v15, not v16's absolute paths — D28's finding is v16-specific, not a general newer-versions trend). See **D35** |
+| 5 | clear-cache | ✅ Same | — |
+| 6 | clear-website-cache | ✅ Same | — |
+| 7 | list-apps | ⚡ Different | See S10/D34 above |
+| 8 | list-apps -f json | ⚡ Different | Same — no version field |
+| 9 | set-maintenance-mode on/off | ✅ Same | — |
+| 10 | scheduler pause/resume/enable | ✅ Same | — |
+| 11 | set-admin-password | ✅ Same | — |
+| 12 | add-user | ✅ Same | — |
+| 13 | build-search-index | ✅ Same | Still enqueue-only (D9) |
+| 14 | rebuild-global-search | ✅ Same | Still synchronous |
+| 15 | doctor | ⚡ Minor | New job type `update_gravatar` in queue — side effect of `add-user` on this version, not an independent doctor change |
+| 16 | build --app frappe | ✅ Same | ~10.7s |
+| 17 | setup requirements | ⚡ Different | Node step includes `npm warn` deprecation notices and a `snyk-protect` patch-application step not seen in v15/v16's plain `yarn install` |
+
+### GROUP Summary (v14)
+
+| Result | Count |
+|---|---|
+| ✅ Same as v15/v16 | 11 |
+| ⚡ Different | 6 |
+| ❌ Fails (before fix) | 1 (bench init, resolved) |
+
+**No permanent failures — v14 works fully on this image once the Python-version workaround is applied.** `v14-test.local` confirmed healthy (`frappe` listed, real version `14.101.1` per `apps.json`).
+
+## Decision Log Additions
+
+### D32: Frappe v14 requires Python 3.11 (not the image's default 3.14) plus dev headers
+**Discovered in:** Frappe v14 environment setup, S7 (bench init)
+**Finding:** Frappe v14 hard-pins `pypika==0.48.9`, whose `setup.py` uses the Python `ast.Str` API — deprecated since Python 3.8, **removed entirely in Python 3.12**. `frappe/bench:latest`'s default Python (pyenv-managed 3.14.2) fails to build it. Switching to the image's system `/usr/bin/python3.11` (which still has `ast.Str`, just deprecated) fixes that, but exposes a second issue: `hiredis` (another v14 dependency) needs to compile a C extension against `Python.h`, which isn't installed for the system Python by default — `sudo apt-get install python3.11-dev` resolves it.
+**Impact on Custom Agent:** any Agent workflow that provisions a v14 bench using the same generic `frappe/bench:latest` image (shared across all supported Frappe versions) will hit this exact two-stage failure unless it knows in advance to use an older Python and pre-install its dev headers. A generic "bench init" retry loop without this specific knowledge will fail indefinitely.
+**Implementation rule:** for Frappe v14 specifically, run `bench init` with `--python /usr/bin/python3.11`, and ensure `python3.11-dev` is installed in the bench image/container **before** attempting init (either bake it into a v14-specific base image, or install it via an init step). Do not assume the same Python version works across all supported Frappe major versions on a shared base image — pin per-version Python requirements explicitly (v14: 3.11 with dev headers; v15/v16: default image Python is fine, per Phase 1/2 testing).
+
+### D33: `--mariadb-user-host-login-scope` doesn't exist in v14 — must use `--no-mariadb-socket`
+**Discovered in:** Frappe v14 environment setup, S9 (bench new-site)
+**Finding:** `bench new-site --mariadb-user-host-login-scope='%' ...` fails on v14 with `Error: No such option: --mariadb-user-host-login-scope` — this flag doesn't exist at all in v14's bench CLI (confirmed via `--help`). It's a v15+ addition; D5 documented it as the *replacement* for the now-deprecated `--no-mariadb-socket` on v15, but v14 predates that replacement entirely and only supports the older flag.
+**Impact on Custom Agent:** any Agent logic that always uses the "modern" `--mariadb-user-host-login-scope` flag (correct guidance for v15+, per D5) will fail outright on v14 and (per the v13 setup task's own hint) likely v13 too — this is a hard version boundary, not a deprecation-warning situation.
+**Implementation rule:** the Agent must select the correct `new-site`/socket flag based on the target Frappe major version: `--no-mariadb-socket` for v14 and earlier, `--mariadb-user-host-login-scope='%'` for v15 and later. Never hardcode one flag across all supported versions.
+
+### D34: v14's `bench list-apps` shows only the app name, no version or branch
+**Discovered in:** Frappe v14 environment setup, S10 (verify)
+**Finding:** `bench --site {s} list-apps` on v14 prints just `frappe` — no version number, no branch name, unlike v15/v16's `frappe {version} {branch}` format. Same for the `-f json` variant (`{"site": ["frappe"]}`, no version key). The real installed version is still tracked internally (confirmed via `sites/apps.json`: `"version": "14.101.1"`), it's just not surfaced by this command on v14.
+**Impact on Custom Agent:** if the Agent parses `list-apps` output to determine an installed app's version (e.g. to decide whether an update is needed, or to report version info to Press), that parsing will silently get nothing on v14 even though the app and its version both genuinely exist.
+**Implementation rule:** don't rely on `bench list-apps` output for version information across all Frappe versions — read `sites/apps.json` directly (or `sites/{site}/site_config.json` combined with the app's own `__init__.py`/`hooks.py` version string) for a version lookup that works consistently regardless of which major version's `list-apps` format is in play.
+
+### D35: v14's `bench backup` uses `mysqldump`, not `mariadb-dump`
+**Discovered in:** Frappe v14 Tier A testing, #4 (backup)
+**Finding:** v15/v16's backup command invokes `mariadb-dump` (confirmed throughout Phase 1-3) with `set -o pipefail; mariadb-dump ... | gzip`. v14's backup invokes the older `mysqldump` binary name, wrapped in a different shell pattern: `self=$$; ( mysqldump ... || kill $self ) | gzip`. Both binaries exist and work in this environment (MariaDB ships both `mysqldump` and `mariadb-dump` as compatible aliases), so functionally the backup succeeds either way — but the exact command text differs.
+**Impact on Custom Agent:** if the Agent parses `bench backup --verbose`'s printed dump command (e.g. to extract connection parameters, or to detect what tool is being used for a security/audit check), it must handle both binary names and both shell-wrapping patterns.
+**Implementation rule:** don't string-match on `mariadb-dump` specifically when inspecting backup command output — treat `mysqldump` and `mariadb-dump` as equivalent, and don't assume a fixed shell-wrapping pattern (`set -o pipefail; ...` vs `self=$$; (... || kill $self)`) across Frappe versions.
