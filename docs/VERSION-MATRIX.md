@@ -132,3 +132,60 @@ All commands tested identically to Phase 1 Tier A, against `v16-test.local` (ben
 | Remove IngressRoute | ✅ | ✅ | Identical |
 
 **28/29 identical to v15, 1/29 shows a real behavioral difference** (run-patch verbosity).
+
+---
+
+## Frappe v14
+
+- **bench:** 5.31.0 (same image as all versions)
+- **Python:** required 3.11 specifically (`--python /usr/bin/python3.11`) — the image's default 3.14 fails (`pypika` depends on the removed `ast.Str` API). Also required `python3.11-dev` installed for `hiredis`'s native compilation. See D32.
+- **Node.js:** v24.13.0 (image default works fine for v14 — only Python needed downgrading)
+- **MariaDB:** 10.11 (shared `frappe-system` instance)
+- **Redis:** 8 (dedicated `redis-v14`, 3-container pattern per D24)
+- **Frappe version:** 14.101.1 — note `list-apps` doesn't display this (D34); confirmed via `sites/apps.json` instead
+- **bench new-site flags:** `--mariadb-user-host-login-scope` **does not exist** in v14 — must use `--no-mariadb-socket` (D33)
+- **Notes:**
+  - `bench init` needs the D32 workaround (Python 3.11 + dev headers) — otherwise fails outright
+  - `new-site` shows two new steps not in v15/v16: `Restoring Database file...`, `Updating country info`
+  - Still shows the MariaDB version deprecation warning (like v15, unlike v16)
+  - `list-apps` shows bare app name only, no version/branch (D34)
+  - `backup` uses `mysqldump` (not `mariadb-dump`) with an older shell-wrapping pattern, but still relative paths like v15 (D35)
+  - `setup requirements` includes an `npm`/`snyk-protect` step not seen in v15/v16's plain `yarn`
+
+## Frappe v13
+
+- **Status: ❌ Incompatible with `frappe/bench:latest` as currently configured.**
+- Python-side issues resolvable with the same D32 workaround (3.11 + dev headers)
+- **Node-side: not resolvable.** `node-sass`'s native C++ addon fails to compile against Node v24.13.0's ABI — a hard compatibility wall (node-sass was deprecated industry-wide for exactly this reason). v13 officially requires Node 14; bridging that gap would need a dedicated older-Node base image, out of scope for this pass. See D36.
+- No Tier A testing performed — setup never completed.
+- **Practical floor for this project's current tooling: Frappe v14.** v13 and earlier are unsupported without a fundamentally different (older-Node) image.
+
+---
+
+## Full Command Comparison: v13 – v16
+
+| Command | v13 | v14 | v15 | v16 | Notes |
+|---|---|---|---|---|---|
+| bench init | ❌ (node-sass/Node ABI, D36) | ⚡ (needs Python 3.11 + dev headers, D32) | ✅ | ✅ | v13 unsupported on this image; v14 needs a workaround |
+| new-site | — (setup failed) | ⚡ (`--no-mariadb-socket` required, no login-scope flag exists, D33) | ✅ | ⚡ (2 new steps, no MariaDB warning, D26) | Socket flag is a hard version boundary, not just a deprecation |
+| migrate | — | ✅ | ✅ | ⚡ (new cleanup steps, D27) | |
+| migrate --skip-failing | — | ✅ | ✅ | ✅ | |
+| migrate --skip-search-index | — | ✅ | ✅ | ✅ | |
+| backup --with-files --verbose | — | ⚡ (`mysqldump`, older shell pattern, relative paths, D35) | ✅ | ⚡ (absolute paths, D28) | Binary name AND path format both vary by version |
+| clear-cache | — | ✅ | ✅ | ✅ | |
+| clear-website-cache | — | ✅ | ✅ | ✅ | |
+| list-apps | — | ⚡ (no version/branch shown, D34) | ✅ | ✅ | |
+| list-apps -f json | — | ⚡ (same, no version field) | ✅ | ✅ | |
+| set-maintenance-mode on/off | — | ✅ | ✅ | ✅ | |
+| scheduler pause/resume/enable | — | ✅ | ✅ | ✅ | |
+| set-admin-password | — | ✅ | ✅ | ✅ | |
+| add-user | — | ✅ | ✅ | ✅ | |
+| build-search-index | — | ✅ (enqueue-only, D9) | ✅ | ✅ | Consistent across all working versions |
+| rebuild-global-search | — | ✅ (synchronous) | ✅ | ✅ | Consistent across all working versions |
+| doctor | — | ⚡ (extra `update_gravatar` job, minor) | ✅ | ⚡ (extra `delete_dynamic_links` job, D27 side-effect) | Both diffs are side effects of other version-specific behavior, not doctor itself changing |
+| build --app frappe | — | ✅ (~10.7s) | ✅ | ✅ (~15-18s) | |
+| setup requirements | — | ⚡ (npm/snyk-protect step) | ✅ | ✅ | |
+| run-patch | — | not tested | ✅ (verbose) | ⚡ (silent, D30) | |
+| drop-site | — | not tested | ✅ | ⚡ (different archive path, D29) | |
+
+**Legend:** ✅ works identically to the v15 baseline · ⚡ works but differs (see linked Decision Log entry) · ❌ fails · — not reached (setup incomplete)
