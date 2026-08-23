@@ -1999,3 +1999,103 @@ configmap "test-dockerfile" deleted from frappe-system namespace
 | P8 Cleanup | ✅ Pass |
 
 **7/8 clean, 1/8 surfaced a real infrastructure consideration (registry pull throttling) rather than a bug in the build pipeline itself.**
+
+## 2026-08-23 — Phase 3, GROUP Q: S3 Backup (IDrive e2)
+
+Replaces the original Agent's `mkfifo` + `rclone rcat` streaming design with a simpler, K8s-native pattern: `bench backup` writes to the PVC → a Job uploads those files to S3-compatible storage.
+
+**Credential handling:** same discipline as Group P — IDrive e2 access/secret keys read once from the local file, written to a local env-file, transferred via `scp` to a private non-repo server directory, loaded into the K8s Secret via `--from-env-file` (never as literal `--from-literal=` values on a visible command line), then shredded on both ends immediately.
+
+### Q1: IDrive e2 secret — ✅ Pass
+```
+$ kubectl create secret generic idrive-e2-secret --from-env-file=... -n frappe-system
+secret/idrive-e2-secret created
+$ kubectl get secret idrive-e2-secret -n frappe-system
+idrive-e2-secret   Opaque   3   16m
+```
+
+### Q2: bench backup — ✅ Pass
+```
+$ bench --site test.local backup --with-files --verbose
+Backup for Site test.local has been successfully completed with files
+```
+Files: `sites/test.local/private/backups/20260823_031915-test_local-{database.sql.gz,files.tar,private-files.tar,site_config_backup.json}`.
+
+### Q3: S3 upload Job manifest — ✅ Pass (written), see Q4 for two real bugs found running it
+
+### Q4: Bucket create + run upload — ⚡ Pass with two modifications
+
+**Bucket create:** ✅ clean — `make_bucket: frappe-k3s-test-backups` (via a small secret-referencing Pod manifest instead of `kubectl run --env=<value>`, which would've put the raw access key on the command line).
+
+**First upload attempt — FAILED:**
+```
+Error from server (BadRequest): container "uploader" in pod "s3-backup-upload-tvckr" is waiting to start: CreateContainerConfigError
+...
+Warning  Failed  kubelet  Error: secret "idrive-e2-secret" not found
+```
+**Root cause:** the spec itself has a namespace mismatch — Q1 creates `idrive-e2-secret` in `frappe-system`, but Q3's Job runs in `frappe-v15`. Kubernetes Secrets are strictly namespace-scoped; a Job can only reference a Secret that lives in its own namespace.
+**Fix:** copied the secret from `frappe-system` to `frappe-v15` via the K8s API (`kubectl get secret ... -o json` → strip metadata → `kubectl apply -n frappe-v15 -f -`) — this moves the already-base64-encoded secret data through `kubectl` without ever re-touching the raw credential text.
+
+**Second upload attempt — FAILED:**
+```
+aws: [ERROR]: The user-provided path /backup-source/sites/test.local/private/backups/ does not exist.
+Upload complete: 255
+```
+**Root cause:** another spec mismatch — the PVC (`bench-v15-data`) is mounted at `/home/frappe/bench-data`, and `bench init` created the actual bench at `frappe-bench/` **inside** that mount (a deliberate choice from Phase 1, since `bench init` requires its target directory not to already exist). So from the PVC root, the real path is `frappe-bench/sites/...`, not `sites/...` directly. The manifest as given assumed the PVC root *was* the bench directory.
+**Fix:** corrected the mount path in `k3s/s3-upload-job.yaml` to `/backup-source/frappe-bench/sites/test.local/private/backups/`.
+
+**Third attempt — SUCCESS:**
+```
+$ kubectl wait --for=condition=complete job/s3-backup-upload -n frappe-v15 --timeout=120s
+job.batch/s3-backup-upload condition met
+...
+Upload complete: 0
+```
+All 9 accumulated backup files (from every backup taken across this whole engagement, not just Q2's) uploaded successfully.
+
+### Q5: Verify files on IDrive e2 — ✅ Pass
+```
+$ aws s3 ls s3://frappe-k3s-test-backups/test.local/ --endpoint-url https://s3.eu-central-2.idrivee2.com
+2026-08-23 07:23:18   1182898  20260822_205446-test_local-database.sql.gz
+... (12 files total, all 3 backup sets, real non-zero sizes)
+```
+
+### Q6: Download from S3 and restore (full cycle) — ✅ Pass
+The command given for this step (`kubectl run s3-download ...`) was missing both AWS credential env vars and any volume mount — same underspecified-example pattern hit earlier in this project. Built a proper Pod manifest (`k3s/s3-download-pod.yaml`) mounting the same `bench-v15-data` PVC at `/restore-target`, downloading into a scratch subdirectory (`s3-restore-test/`) so `bench-v15` can reach the files directly (same underlying PVC).
+```
+$ aws s3 cp s3://.../test.local/ /restore-target/s3-restore-test/ --recursive ...
+Download complete: 0
+```
+Then ran the actual restore from the downloaded files:
+```
+$ bench --site test.local restore \
+  --mariadb-root-username root --mariadb-root-password *** --admin-password *** \
+  --with-public-files .../s3-restore-test/20260823_031915-test_local-files.tar \
+  --with-private-files .../s3-restore-test/20260823_031915-test_local-private-files.tar \
+  .../s3-restore-test/20260823_031915-test_local-database.sql.gz
+Site test.local has been restored with files
+```
+Verified `bench --site test.local list-apps` → `frappe 15.118.0 version-15` — full **backup → S3 upload → S3 download → restore** cycle confirmed working end-to-end, `test.local` intact throughout (restored from a backup of its own current state, so no meaningful data change).
+
+**Cleanup note:** the `s3-download` Pod ran as root, leaving root-owned scratch files on the shared PVC that the `frappe` user couldn't remove directly — needed `kubectl exec ... -- sudo rm -rf` to clean up. Worth remembering for any real Agent design: containers writing to a shared bench PVC should run as the `frappe` UID, not root, to avoid this exact friction.
+
+### Q7: Cleanup S3 test data — ✅ Pass
+```
+$ aws s3 rm s3://frappe-k3s-test-backups/ --recursive ...
+delete: s3://frappe-k3s-test-backups/test.local/... (12 files deleted)
+```
+Bucket itself left in place (empty) — not deleted, since bucket deletion wasn't requested and IDrive e2 buckets aren't disposable K8s resources.
+
+### GROUP Q Summary
+
+| Step | Result |
+|---|---|
+| Q1 IDrive e2 secret | ✅ Pass |
+| Q2 bench backup | ✅ Pass |
+| Q3 Upload Job manifest | ✅ Pass |
+| Q4 Bucket + run upload | ⚡ Pass with 2 modifications (secret namespace, PVC path) |
+| Q5 Verify on S3 | ✅ Pass |
+| Q6 Download + restore (full cycle) | ✅ Pass |
+| Q7 S3 cleanup | ✅ Pass |
+
+**5/7 clean, 2/7 surfaced real spec bugs (both fixed and documented) rather than infrastructure problems.** Both bugs are exactly the kind of thing worth catching now: a namespace-scoping mistake and a path assumption that didn't match how the bench was actually laid out on its PVC — both would silently break a real Agent's backup pipeline if shipped as originally specified.

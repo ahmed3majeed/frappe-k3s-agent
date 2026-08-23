@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s3-backup-upload
+  namespace: frappe-v15
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: uploader
+          image: amazon/aws-cli:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              aws s3 cp \
+                /backup-source/frappe-bench/sites/test.local/private/backups/ \
+                s3://frappe-k3s-test-backups/test.local/ \
+                --recursive \
+                --endpoint-url https://s3.eu-central-2.idrivee2.com
+              echo "Upload complete: $?"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: idrive-e2-secret
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: idrive-e2-secret
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              value: "eu-central-2"
+          volumeMounts:
+            - name: bench-data
+              mountPath: /backup-source
+      volumes:
+        - name: bench-data
+          persistentVolumeClaim:
+            claimName: bench-v15-data
