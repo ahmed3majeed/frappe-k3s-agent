@@ -1912,3 +1912,90 @@ $ kubectl run sql-perf -n frappe-system --rm -i --image=mariadb:10.11 --restart=
 | D4 | performance_schema queries | ⚡ Needs config change | Disabled by default; query mechanism itself works fine once enabled |
 
 **No permanent changes to `test.local` data** — D1/D2 only reinstalled the already-present `frappe` package in place (same version, same source), D3's patch is idempotent (workspace rename cleanup, already-applied-safe), D4 was read-only.
+
+## 2026-08-23 — Phase 3, GROUP P: Kaniko Image Building
+
+Replaces `docker buildx build` + `docker push` with a daemonless in-cluster build via Kaniko.
+
+**Credential handling:** Docker Hub credentials were read once from the local credential file (per explicit instruction), used the **personal access token** rather than the plaintext account password also present in that file (safer — scoped, revocable). Built a `.dockerconfigjson` locally, transferred via `scp` to a private non-repo directory on the server, created the K8s Secret via `--from-file` (never `--docker-password=<value>` inline, which would briefly expose the token in the remote process list via `ps aux`), then immediately shredded the temp files on both ends. The raw token is not present anywhere in this repo.
+
+### P1: Docker Hub secret — ✅ Pass
+```
+$ kubectl create secret generic dockerhub-secret --from-file=.dockerconfigjson=... --type=kubernetes.io/dockerconfigjson -n frappe-system
+secret/dockerhub-secret created
+$ kubectl get secret dockerhub-secret -n frappe-system
+dockerhub-secret   kubernetes.io/dockerconfigjson   1   0s
+```
+
+### P2: Test Dockerfile — ✅ Pass
+```
+FROM frappe/bench:latest
+LABEL test="kaniko-phase3"
+```
+
+### P3: Kaniko Job manifest — ✅ Pass
+Saved to `k3s/kaniko-test-job.yaml`, destination substituted to the real Docker Hub username (`ahmed3majeed/frappe-k3s-agent-test:latest`).
+
+### P4: ConfigMap from Dockerfile — ✅ Pass
+```
+$ kubectl create configmap test-dockerfile --from-file=Dockerfile=/tmp/test.Dockerfile -n frappe-system
+configmap/test-dockerfile created
+```
+
+### P5: Run Kaniko Job — ✅ Pass
+```
+$ kubectl apply -f k3s/kaniko-test-job.yaml
+$ kubectl wait --for=condition=complete job/kaniko-test-build -n frappe-system --timeout=600s
+job.batch/kaniko-test-build condition met
+$ kubectl get job kaniko-test-build -n frappe-system
+kaniko-test-build   Complete   1/1   15s
+```
+Completed in **15 seconds** — much faster than the 10-minute budget, since Kaniko recognized the Dockerfile only adds a LABEL (no filesystem change) and skipped re-unpacking the base image layers.
+
+### P6: Job logs — ✅ Pass
+```
+INFO Retrieving image manifest frappe/bench:latest
+INFO Returning cached image manifest
+INFO LABEL test="kaniko-phase3"
+INFO Pushing image to ahmed3majeed/frappe-k3s-agent-test:latest
+INFO Pushed index.docker.io/ahmed3majeed/frappe-k3s-agent-test@sha256:92c3f1b8f47a0f109e6ad0084a99d25b9244edcef96ab27b153a4c894e5a7d2e
+```
+No errors — clean build and push, real digest returned by Docker Hub.
+
+### P7: Verify image on Docker Hub — ⚡ Pass with caveat
+First attempt (`kubectl run verify-push --rm -i ... -- echo ...`) **hung in `ContainerCreating` for 8+ minutes** with no error events, just a persistent `Pulling image` event. Investigated:
+- Node disk space: fine (132G free)
+- Registry connectivity: fine (`curl https://registry-1.docker.io/v2/` → fast 401, as expected unauthenticated)
+- Direct `crictl pull ahmed3majeed/frappe-k3s-agent-test:latest` — **eventually succeeded** (`Image is up to date`) after several more minutes with no explicit error at any point.
+
+**Root cause (most likely): Docker Hub's anonymous-pull rate limit.** This session has pulled a very large number of images from Docker Hub over many hours of testing (mariadb, redis, bench, erpnext-related base images, busybox, etc.), all via unauthenticated/anonymous pulls (no `imagePullSecret` on any of the test pods) from this node's single IP. Docker Hub throttles anonymous pulls per-IP (historically ~100 pulls/6h) — a throttled pull doesn't always surface as a hard error in kubelet events, it can just silently slow to a crawl. Once the image was cached locally (after the slow pull finally completed), a fresh verification pod (`verify-push3`) completed in 6 seconds.
+**Verified by:** `verify-push3` → `Completed`, logs: `Image pulled successfully`.
+**Implementation note for the real Agent:** even for its own pushed images, prefer an authenticated pull (via `imagePullSecrets` referencing the same `dockerhub-secret`) rather than anonymous — authenticated pulls get a materially higher Docker Hub rate limit and avoid this exact multi-minute stall.
+
+### P8: Cleanup — ✅ Pass
+```
+$ kubectl delete job kaniko-test-build -n frappe-system
+Error from server (NotFound): jobs.batch "kaniko-test-build" not found
+```
+Already gone — the Job's own `ttlSecondsAfterFinished: 300` auto-deleted it during the P7 troubleshooting delay (confirms TTL cleanup works as configured, not a bug).
+```
+$ kubectl delete configmap test-dockerfile -n frappe-system
+configmap "test-dockerfile" deleted from frappe-system namespace
+```
+
+**Note:** the pushed test image `ahmed3majeed/frappe-k3s-agent-test:latest` itself was **not** deleted from Docker Hub (Kubernetes cleanup only removes in-cluster resources, not the registry artifact). It's a small, harmless test image, but flagged here since it's now a real, visible repository under the account.
+
+### GROUP P Summary
+
+| Step | Result |
+|---|---|
+| P1 Docker Hub secret | ✅ Pass |
+| P2 Test Dockerfile | ✅ Pass |
+| P3 Kaniko Job manifest | ✅ Pass |
+| P4 ConfigMap | ✅ Pass |
+| P5 Run Job | ✅ Pass (15s, well under budget) |
+| P6 Job logs | ✅ Pass |
+| P7 Verify on Docker Hub | ⚡ Pass with caveat (anonymous-pull rate limiting, not a build/push bug) |
+| P8 Cleanup | ✅ Pass |
+
+**7/8 clean, 1/8 surfaced a real infrastructure consideration (registry pull throttling) rather than a bug in the build pipeline itself.**

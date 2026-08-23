@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kaniko-test-build
+  namespace: frappe-system
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--dockerfile=/workspace/Dockerfile"
+            - "--context=dir:///workspace"
+            - "--destination=ahmed3majeed/frappe-k3s-agent-test:latest"
+            - "--skip-tls-verify"
+          volumeMounts:
+            - name: dockerfile
+              mountPath: /workspace
+            - name: dockerconfig
+              mountPath: /kaniko/.docker
+      volumes:
+        - name: dockerfile
+          configMap:
+            name: test-dockerfile
+        - name: dockerconfig
+          secret:
+            secretName: dockerhub-secret
+            items:
+              - key: .dockerconfigjson
+                path: config.json
