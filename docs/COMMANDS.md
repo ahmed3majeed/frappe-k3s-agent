@@ -861,3 +861,20 @@ Full end-to-end verification of the K8s-native operations that replace what the 
 Manifests: `k3s/bench-pvc.yaml`, `k3s/bench-deployment.yaml`, `k3s/bench-service.yaml`, `k3s/bench-ingressroute.yaml`, `k3s/ingressroute-custom-domain.yaml`, `k3s/middleware-maintenance.yaml`.
 
 Full raw output for every Phase 2 test: `RUNBOOK.md`, dated 2026-08-23, "Phase 2, GROUP K/L/M/N/O" sections.
+
+---
+
+## ⚠️ Known Gotchas
+
+### Traefik duplicate Host() — no error on conflict
+**Finding:** Traefik does not reject duplicate `Host()` matches across two different `IngressRoute` resources. Creating a second `IngressRoute` for a host that's already routed by another `IngressRoute` succeeds silently — both are accepted as separate routers, with no validation error and no admission-time warning.
+
+**Where this showed up:** Phase 2, Group M1 — created `k8s-test-domain` with `Host(`k8s-test.local`)`, the same host already routed by the `bench-test` IngressRoute from Group K5. Both existed simultaneously until `k8s-test-domain` was deliberately removed at M3.
+
+**Why it matters for the Custom Agent:** if a bench/domain-management code path ever creates an `IngressRoute` without first checking whether that host is already routed elsewhere, you get two competing routers pointed at (potentially different) backends — a real bug with no error to catch it.
+
+**Implementation rule:**
+- Prefer `kubectl apply` (upsert by resource name) over `kubectl create`, so re-running the same domain-add operation updates the existing route instead of creating a duplicate.
+- For a genuinely new domain, check existing `IngressRoute`s' `Host()` matches first (`kubectl get ingressroute -A -o yaml` / a label-based lookup) before creating a new one, so the Agent can reject or warn on a real conflict instead of silently doubling up.
+
+See `RUNBOOK.md`, Decision Log **D12**, for the full record.

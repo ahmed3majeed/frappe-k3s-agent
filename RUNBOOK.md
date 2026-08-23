@@ -1824,3 +1824,22 @@ Image confirmed changed: `busybox:1.36` → `busybox:1.35`. Namespace deleted im
 |---|---|
 | O1 (as-specified, fallback) | ✅ Pass |
 | O1 (live mechanism demo) | ✅ Pass |
+
+## 2026-08-23 — Decision Log Addition (formalizing a Phase 2 finding)
+
+### D12: Traefik duplicate Host() behavior
+Finding: Traefik does not reject duplicate Host() matches across two
+         different IngressRoute resources — creating a second IngressRoute
+         for the same host results in two competing routers with no error.
+         Observed directly in Phase 2 Group M1: created `k8s-test-domain`
+         with the same Host(`k8s-test.local`) as the existing `bench-test`
+         IngressRoute from K5 — both were accepted, no conflict/rejection
+         at admission time.
+Impact: Custom Agent must pre-check for existing IngressRoute on the same
+        host before creating a new one, or duplicate/competing routers can
+        silently accumulate with no error signal to catch the mistake.
+Implementation rule: always use `kubectl apply` (upsert, matched by
+        resource name) rather than `kubectl create`, OR use a
+        check-then-create pattern (list existing IngressRoutes' Host()
+        matches before creating a new one) to guarantee only one router
+        exists per host.
