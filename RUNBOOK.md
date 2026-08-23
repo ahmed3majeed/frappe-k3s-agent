@@ -2197,3 +2197,26 @@ Clean, exit 0. `bench-v15` pod healthy throughout — never touched, since no up
 **Finding:** `bench-v15` (the original Phase 1 test bench) was created as a bare `kind: Pod` with no owning controller — `kubectl get pod bench-v15 -o jsonpath="{.metadata.ownerReferences}"` returns empty, and no Deployment/ReplicaSet/StatefulSet exists in `frappe-v15`. The Group R task instructions assumed that deleting this pod would trigger automatic recreation ("K8s will recreate it automatically") — **this is false for an unmanaged Pod.** Only pods owned by a controller get recreated on deletion; a bare Pod that's deleted is simply gone until something re-applies its manifest.
 **Impact on Custom Agent:** any restart/update logic the Agent runs (`kubectl rollout restart deployment/...` or a delete-and-recreate fallback) must know in advance whether the target is actually a controller-managed resource. Applying Deployment-style restart logic to a bare-Pod bench (as `bench-v15` still is, a holdover from before Group K's proper Deployment-based bench pattern existed) would either fail cleanly (`rollout restart` on a nonexistent Deployment) or, worse, silently destroy the pod if the delete-fallback were used without a saved manifest to reapply.
 **Implementation rule:** every bench the Agent manages must be a Deployment (as established in Phase 2 Group K's `k3s/bench-deployment.yaml` pattern) — never a bare Pod — specifically so that restart/update operations can rely on controller-managed recreation semantics. Before running any delete-based fallback on any resource, the Agent must first confirm the resource has an owning controller (non-empty `ownerReferences`); if not, either refuse the operation or ensure a manifest is available to reapply immediately after deletion, exactly as this test did as a precaution.
+
+## 2026-08-23 — Decision Log Additions (pre-GROUP RS audit)
+
+Audited RUNBOOK.md against a checklist of 6 critical findings before starting Group RS. 4 were already formal Decision Log entries (D13 Docker Hub rate limiting, D14 Secrets namespace-scoping, D15 PVC mount path offset, D16 bare Pod vs Deployment). 2 existed only as inline mentions and are formalized here.
+
+### D17: git remote is named "upstream" not "origin"
+**Discovered in:** Group R, R2 (also matches the earlier Phase 1 Group B finding)
+**Finding:** the `frappe` app's git remote, as cloned by `bench init`, is named `upstream`, not `origin`. `git remote get-url origin` / `git fetch ... origin ...` fails with `error: No such remote 'origin'`. Confirmed identically in two independent tests (Phase 1 Group B, and Group R's R2).
+**Impact on Custom Agent:** any git operation the Agent runs against an app's checkout (fetch, remote inspection, diff against a fetched ref) must target `upstream`, not `origin` — this isn't a one-off, it's how every bench-init'd app is set up.
+**Implementation rule:** all git fetch/remote commands must use `upstream`:
+```
+git fetch --depth 1 upstream {branch}
+```
+**not**
+```
+git fetch --depth 1 origin {branch}
+```
+
+### D18: performance_schema disabled by default
+**Discovered in:** Phase 1 Group C (SQL commands) and Group D (uncertain commands, D4)
+**Finding:** `SELECT @@performance_schema;` → `0` on this MariaDB instance — disabled by default. Confirmed identically in two independent tests. The `events_statements_summary_by_digest` query itself is valid and doesn't error while disabled, it just returns 0 rows.
+**Impact on Custom Agent:** any slow-query-analysis or performance-report feature the Agent offers (mirroring the original Agent's `performance_schema` queries) will silently return empty results, not an error, unless the MariaDB server was configured with performance_schema enabled from the start. A silent empty result is easy to mistake for "no slow queries" rather than "the feature isn't actually on."
+**Implementation rule:** add `[mysqld] performance_schema=ON` to the MariaDB config (`custom.cnf`) at server setup time — this requires a MariaDB restart to take effect, so it must be decided during initial infrastructure provisioning, not toggled on-demand per query.
