@@ -1265,3 +1265,36 @@ Not run. Three problems, independent of each other:
 3. **No `DROP DATABASE` statement anywhere** — despite the step title "Drop a test database," the command as given cannot drop anything.
 
 Dropping a database is irreversible and this MariaDB instance holds the real `_9354d31722f40d9e` (test.local) database alongside `mysql`/`sys`/`information_schema`. Rather than guess a target and write the DROP statement myself, stopping here to confirm the exact database name intended before running anything for D6.
+
+## 2026-08-23 — Tier D: D6 (resolved with user confirmation)
+
+Per user decision: created a throwaway database, dropped it, and verified — rather than guessing a target on real shared infrastructure.
+
+### D6: drop a test database — ✅ Pass (redesigned)
+```
+$ kubectl run mariadb-test6a ... -e "CREATE DATABASE test_drop_db; SHOW DATABASES LIKE 'test_drop_db';"
+Database (test_drop_db)
+test_drop_db
+```
+```
+$ kubectl run mariadb-test6 -n frappe-system --image=mariadb:10.11 --restart=Never --rm -i -- mysql -h mariadb.frappe-system.svc.cluster.local -u root -p*** -e "DROP DATABASE test_drop_db;"
+EXIT: 0
+```
+```
+$ kubectl run mariadb-test6b ... -e "SHOW DATABASES LIKE 'test_drop_db';"
+(no rows) — EXIT: 0
+```
+Confirmed: database created, verified present, dropped, verified absent. No real data (`mysql`, `sys`, `information_schema`, or the `_9354d31722f40d9e` site database) was touched.
+
+### Tier D Final Summary
+
+| ID | Operation | Result | Notes |
+|---|---|---|---|
+| D1 | create temp user | ✅ Pass | ALL PRIVILEGES ON *.* — fine for short-lived test creds only |
+| D2 | drop temp user | ✅ Pass | Attach race hid output; verified independently |
+| D3 | database size | ✅ Pass | Revealed real db name `_9354d31722f40d9e` |
+| D4 | list tables | ⚡ Pass with modification | Wrong db name + shell `\|\|` fallback ran outside the pod |
+| D5 | optimize tables (dry) | ⚡ Pass with modification | Same wrong db name assumption |
+| D6 | drop a test database | ✅ Pass (redesigned) | Original command had no DROP statement, no password, no target db — redesigned as create→verify→drop→verify on a disposable database, per user confirmation |
+
+**5/6 passed cleanly (or with a straightforward correction), 1/6 required stopping to get explicit direction before running anything destructive.**
