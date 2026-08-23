@@ -878,3 +878,54 @@ Full raw output for every Phase 2 test: `RUNBOOK.md`, dated 2026-08-23, "Phase 2
 - For a genuinely new domain, check existing `IngressRoute`s' `Host()` matches first (`kubectl get ingressroute -A -o yaml` / a label-based lookup) before creating a new one, so the Agent can reject or warn on a real conflict instead of silently doubling up.
 
 See `RUNBOOK.md`, Decision Log **D12**, for the full record.
+
+---
+
+## GROUP D — Uncertain Commands (pip editable installs, run-patch, performance_schema)
+
+---
+
+### pip install -e {app_path}
+**Original Agent uses:** `docker exec {container} {venv}/bin/pip install -e {app_path}` (app dependency reinstall)
+**K8s equivalent:** `kubectl exec {pod} -- bash -c "{venv}/bin/pip install -e {app_path}"`
+**Status:** ✅ Pass
+**Modification:** None.
+**Verified by:** `pip list --editable` and `pip show -f frappe | grep Editable` both confirm `Editable project location: .../apps/frappe` — genuinely editable, not just re-copied.
+
+---
+
+### python -m pip install -e {app_path}
+**Original Agent uses:** same operation, alternate invocation form used in some code paths
+**K8s equivalent:** `kubectl exec {pod} -- bash -c "{venv}/bin/python -m pip install -e {app_path}"`
+**Status:** ✅ Pass
+**Modification:** None — identical outcome to the plain `pip install -e` form.
+**Verified by:** Same editable-install checks as above.
+
+---
+
+### bench run-patch
+**Original Agent uses:** `docker exec {container} bench --site {s} run-patch {patch_module_path}`
+**K8s equivalent:** same, via `kubectl exec`
+**Status:** ⚡ Modified
+**Modification:** The example patch name given (`frappe.patches.v14_0.update_workspace2_for_rename`) doesn't exist — `ModuleNotFoundError`. The real module (confirmed via `find` in the patches directory) is `frappe.patches.v14_0.update_workspace2`, no `_for_rename` suffix.
+**Verified by:** `Executing frappe.patches.v14_0.update_workspace2 in test.local (...) — Success: Done in 0.587s`.
+
+---
+
+### performance_schema queries (slow query analysis)
+**Original Agent uses:** `mysql -h {host} -e "SELECT ... FROM performance_schema.events_statements_summary_by_digest ..."`, run on the agent host
+**K8s equivalent:** ephemeral SQL pod, same query
+**Status:** ⚡ Needs config change
+**Modification:** `performance_schema` is `OFF`/`0` by default on this MariaDB instance (`SELECT @@performance_schema;` → `0`) — confirmed identically in Phase 1 Group C. The query itself is valid and doesn't error while disabled, it just returns 0 rows. Enabling requires `[mysqld] performance_schema=ON` in server config plus a restart — a server-level change, not something the Agent can toggle per-query.
+**Verified by:** `SELECT @@performance_schema;` → `0`; digest query mechanics already confirmed working in Phase 1 Group C.
+
+---
+
+### GROUP D Summary
+
+| Result | Count |
+|---|---|
+| ✅ Pass | 2 |
+| ⚡ Modified/needs config | 2 |
+| ❌ Fail | 0 |
+| **Total** | **4** |
