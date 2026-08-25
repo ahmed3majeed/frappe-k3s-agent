@@ -2892,3 +2892,18 @@ Setup did not succeed; per the task's own instructions, these steps and Tier A t
 **Finding:** The frappe OS user cannot read /home/ubuntu/.ssh/ so the GitHub deploy key is inaccessible to git operations run as frappe.
 **Impact on Custom Agent:** git push/pull as frappe user fails with Permission denied unless key exists in /home/frappe/.ssh/.
 **Implementation rule:** When provisioning a new server, copy the GitHub deploy key to /home/frappe/.ssh/ with ownership frappe:frappe and permissions 600.
+
+## Open Risks (unresolved — not Decision Log entries)
+
+Findings that need a decision or fix before this project's output is treated as
+production-ready, but aren't "resolved" the way a D-numbered entry is. Format: one
+paragraph, link back to the fuller writeup if one exists elsewhere.
+
+### OR1: /benches/<bench>/docker_execute accepts caller-controlled as_root with no authorization check
+**Where:** agent/web.py:1890-1899 (Kagent repo, not this repo) — full detail in
+kagent/docs/ANALYSIS.md's "SECURITY — MUST RESOLVE BEFORE PRODUCTION" section.
+**Why it's here too:** flagging in this repo's own risk record since k8s_execute()'s
+sudo -n fix (verified in this project's own testing pattern, live on v14/v15/v16) is
+what turned this from a silently-broken request into a working root-exec path. Must be
+resolved (auth/authz, allowlisting, or removing the pass-through) before any real
+traffic reaches this endpoint.
