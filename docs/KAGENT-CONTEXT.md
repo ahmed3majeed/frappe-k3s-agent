@@ -2,7 +2,25 @@
 
 **Purpose of this file:** a self-contained briefing for a fresh Claude Code session picking up this project with zero prior context. Read this file top to bottom before doing anything else — it links out to the deeper reference docs (RUNBOOK.md, COMMANDS.md, VERSION-MATRIX.md, DEPENDENCY-MATRIX.md) but should be enough on its own to understand what exists, why, and what's next.
 
-Generated: 2026-08-25.
+Generated: 2026-08-25. Last maintenance update: 2026-08-25.
+
+---
+
+## MAINTENANCE RULE
+
+**This file must be updated at the end of every major session.** Before ending any Claude Code session that touches this project, run:
+```bash
+cd /home/ubuntu/frappe-k3s-agent && \
+git add docs/KAGENT-CONTEXT.md && \
+git commit -m "docs: update KAGENT-CONTEXT session [date]" && \
+git push origin main
+```
+
+Update these sections each session, only where something actually changed (don't pad — an unchanged section stays as-is):
+- **§6** — add any new Decision Log entries (D39+) that were written to RUNBOOK.md this session
+- **§4** — refresh cluster state (namespaces/pods/services/PVCs) if anything was created, deleted, or reconfigured
+- **§8** — move completed items from "not yet done" into the confirmed-working list; add anything newly discovered as not-yet-done
+- **§9** — add any new files created (manifests, scripts, docs) and where they live
 
 ---
 
@@ -65,7 +83,12 @@ Both users reach the same cluster; `ubuntu` needs `sudo kubectl` (default kubeco
   ```
 | Git identity (on server) | **Not set globally** — `git config --global` is empty (`~/.gitconfig` doesn't exist). Set locally per-repo when needed: `git config user.email "ahmed3mageed@gmail.com"` / `git config user.name "frappe-k3s-agent"` (this is what every commit in the repo uses). |
 
-**Important gap for the `kagent` repo task:** the `github_frappe_agent` deploy key is scoped to the single `frappe-k3s-agent` repo (GitHub deploy keys are per-repo by design) — it **cannot** push to a new `kagent` repo. Creating `kagent` and pushing to it needs either (a) a new deploy key added to that specific new repo, or (b) a PAT with `repo` scope used the same one-time, not-stored-on-server way the original repo was created, or (c) the `gh` CLI authenticated (not currently installed on the server — checked and confirmed absent). Resolve this before attempting repo creation/push.
+**Decided: `kagent` repo push access.** The `github_frappe_agent` deploy key is scoped to the single `frappe-k3s-agent` repo (GitHub deploy keys are per-repo by design) — it cannot push to a new `kagent` repo as-is. Three options were considered:
+- **Option A (chosen):** register the *same* existing `github_frappe_agent.pub` as a second deploy key on the `kagent` repo once it exists. Zero server-side config changes needed — the existing `Host github.com` entry in `~/.ssh/config` already points at this identity file, and GitHub authorizes deploy keys per-repo server-side, so the same key just needs to be added to `kagent`'s deploy key list too.
+- Option B (not chosen): generate a dedicated keypair for `kagent`. Would need a `Host` alias in `~/.ssh/config` (SSH can't route two different `IdentityFile`s to the same literal `github.com` host otherwise) for no real security gain — both repos are personal/low-stakes and sit behind the same server SSH access, which is the actual trust boundary; splitting keys doesn't shrink it.
+- Option C (not chosen): use a PAT for ongoing push operations. Conflicts with this project's established credential discipline (§10, §5) — PATs are used once from the local machine only and never stored on the server. Storing one server-side for routine automated pushes would break that pattern; not storing one would require manual intervention every session, defeating the goal of automatic end-of-session updates.
+
+**Still required regardless of the above:** creating the `kagent` repo itself is a one-time account-level operation that only a PAT (or `gh auth login`) can do — a deploy key can only push to a repo that already exists, it can't create one. So repo creation still uses the same one-time, not-stored-on-server PAT pattern from §3's `Repo creation method` row above; only the *ongoing push* mechanism is Option A.
 
 ---
 
